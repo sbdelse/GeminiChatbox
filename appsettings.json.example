@@ -1,0 +1,49 @@
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  },
+  "AllowedHosts": "*",
+  "GeminiApi": {
+    "ApiKeys": [
+      "第一个 API key",
+      "第二个 API key",
+      "第三个 API key"
+    ],
+    "BaseUrl": "https://generativelanguage.googleapis.com/v1beta",
+    "Models": {
+      "gemini-1.5-flash-latest": {
+        "RPM": 15,
+        "TPM": 1000000,
+        "RPD": 1500,
+        "FallbackModel": "gemini-1.5-flash"
+      },
+      "gemini-1.5-flash-8b-latest": {
+        "RPM": 15,
+        "TPM": 1000000,
+        "RPD": 1500,
+        "FallbackModel": "gemini-1.5-flash-8b"
+      },
+      "gemini-1.5-pro-latest": {
+        "RPM": 2,
+        "TPM": 32000,
+        "RPD": 50,
+        "FallbackModel": "gemini-1.5-pro"
+      },
+      "gemini-exp-1114": {
+        "RPM": 2,
+        "TPM": 32000,
+        "RPD": 50,
+        "FallbackModel": "gemini-1.5-flash"
+      },
+      "gemini-exp-1121": {
+        "RPM": 2,
+        "TPM": 32000,
+        "RPD": 50,
+        "FallbackModel": "gemini-1.5-flash"
+      }
+    }
+  }
+}

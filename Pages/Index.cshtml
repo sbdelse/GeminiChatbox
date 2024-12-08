@@ -1,0 +1,66 @@
+﻿@page
+@model IndexModel
+@{
+    ViewData["Title"] = "Gemini Chat Box";
+}
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>@ViewData["Title"]</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.3/css/bootstrap.min.css">
+    <link rel="stylesheet" href="/css/chat.css" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.8.1/github-markdown.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&family=Noto+Sans+SC:wght@400;600&display=swap" rel="stylesheet">
+    <link rel="icon" type="image/x-icon" href="~/favicon.ico" />
+    <link rel="icon" type="image/svg+xml" href="~/favicon.svg" sizes="any" />
+</head>
+<body>
+    <div class="chat-container">
+        <div class="chat-header">
+            <h1 class="h1 mb-0">Gemini Chat Box</h1>
+            <div class="chat-controls">
+                <select id="modelSelect" class="form-select">
+                    @foreach (var modelItem in Model.AvailableModels)
+                    {
+                        <option value="@modelItem.Value">@modelItem.Text</option>
+                    }
+                </select>
+                <button id="clearBtn" class="btn btn-outline-secondary">清空</button>
+            </div>
+        </div>
+
+        <div class="chat-messages" id="output"></div>
+
+        <div class="chat-input-area">
+            <div class="input-group">
+                <textarea id="promptInput" class="form-control" placeholder="请输入 Prompt..." rows="1" style="overflow-y:hidden;"></textarea>
+                <button id="sendBtn" class="btn btn-primary">
+                    发送 <span class="loading-spinner spinner-border spinner-border-sm"></span>
+                </button>
+            </div>
+            <div class="mt-2">
+                <label for="imageInput" class="form-label">上传图片或文件 (可选):</label>
+                <input type="file" id="imageInput" class="form-control" multiple accept="image/jpeg,image/png,image/webp,image/heic,image/heif,application/pdf,application/x-javascript,text/javascript,application/x-python,text/x-python,text/plain,text/html,text/css,text/md,text/csv,text/xml,text/rtf">
+            </div>
+        </div>
+    </div>
+
+    <!-- 在 chat-container 后添加 footer -->
+    <footer class="footer mt-auto py-3 bg-light">
+        <div class="container text-center">
+            <span class="text-muted">© 2024 Gemini Chat Box | <a href="/Privacy">隐私政策</a></span>
+        </div>
+    </footer>
+
+    <script defer src="https://cdnjs.cloudflare.com/ajax/libs/marked/15.0.3/marked.min.js"></script>
+    <script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/highlight.min.js"></script>
+    <script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+    <script defer src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.3/js/bootstrap.bundle.min.js"></script>
+    <script defer src="/js/chat.js"></script>
+</body>
+</html>

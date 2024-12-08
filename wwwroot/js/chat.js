@@ -1,3 +1,20 @@
+document.addEventListener('DOMContentLoaded', function() {
+    if (typeof renderMathInElement === 'undefined') {
+        window.addEventListener('load', function() {
+            document.querySelectorAll('.message-content').forEach(element => {
+                if (typeof renderMathInElement === 'function') {
+                    renderMathInElement(element, {
+                        delimiters: [
+                            {left: '$$', right: '$$', display: true},
+                            {left: '$', right: '$', display: false}
+                        ]
+                    });
+                }
+            });
+        });
+    }
+});
+
 marked.setOptions({
     highlight: function (code, lang) {
         if (lang && hljs.getLanguage(lang)) {
@@ -19,17 +36,13 @@ const clearBtn = document.getElementById('clearBtn');
 
 let chatHistory = [];
 let isLoading = false;
-
-// 默认自动滚动到底部
 let autoScroll = true;
 
-// 当用户滚动时，判断用户是否离开底部区域
 output.addEventListener('scroll', () => {
     const distanceToBottom = output.scrollHeight - output.scrollTop - output.clientHeight;
     autoScroll = distanceToBottom < 10;
 });
 
-// 图片预览模态框
 document.body.insertAdjacentHTML('beforeend', '<div class="image-modal"><img src="" alt="Preview"></div>');
 const imageModal = document.querySelector('.image-modal');
 
@@ -46,10 +59,7 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
     
-    // 初始化时执行一次
     moveButton();
-    
-    // 监听窗口大小变化
     window.addEventListener('resize', moveButton);
 });
 
@@ -61,13 +71,11 @@ async function sendMessage() {
 
     setLoading(true);
 
-    // 用户输入消息
     if (prompt) {
         addMessage(prompt, 'user');
         chatHistory.push({ role: "user", Content: prompt });
     }
 
-    // 处理图片文件
     const imagesData = [];
     if (imageInput.files.length > 0) {
         for (const file of imageInput.files) {
@@ -81,7 +89,6 @@ async function sendMessage() {
 
     promptInput.value = '';
     imageInput.value = '';
-
     let aiMessage = '';
 
     try {
@@ -121,11 +128,9 @@ async function sendMessage() {
                     }
                     aiMessage += textChunk;
                     if (!aiBubble) {
-                        // 创建AI消息气泡（初次收到时）
                         aiBubble = addMessage('', 'ai');
                     }
                     renderMarkdown(aiBubble, aiMessage);
-                    // 更新右下角复制按钮事件
                     updateBubbleCopyButton(aiBubble.closest('.message'));
 
                     if (autoScroll) {
@@ -159,7 +164,6 @@ function createFilePreview(file) {
 
     const fileInfo = document.createElement('div');
     fileInfo.classList.add('file-info');
-    // 文件名和类型换行显示
     fileInfo.innerHTML = `
         <span class="file-name">${file.name}</span><br>
         <span class="file-type">${file.type || '未知类型'}</span>
@@ -187,11 +191,9 @@ function addMessage(content, type) {
     bubble.classList.add('bubble');
     bubble.style.position = 'relative';
 
-    // 底部右下角复制按钮
     const copyBtn = document.createElement('button');
     copyBtn.classList.add('copy-button');
     copyBtn.textContent = 'Copy';
-    // 对于用户消息立即可用，AI消息在render后会重新绑定
     copyBtn.onclick = () => {
         const messageContent = bubble.querySelector('.message-content').innerText;
         handleCopyButton(copyBtn, messageContent);
@@ -247,7 +249,6 @@ function fileToBase64(file) {
 
 sendBtn.addEventListener('click', sendMessage);
 
-// Enter发送（Shift+Enter换行）
 promptInput.addEventListener('keypress', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !isLoading) {
         e.preventDefault();
@@ -263,12 +264,10 @@ clearBtn.addEventListener('click', () => {
 function renderMarkdown(element, content) {
     element.innerHTML = marked.parse(content);
 
-    // 给所有code元素加上hljs类
     element.querySelectorAll('pre code').forEach(codeEl => {
         codeEl.classList.add('hljs');
     });
 
-    // 为所有代码块添加头部和复制按钮
     element.querySelectorAll('pre > code').forEach(codeElement => {
         const pre = codeElement.parentNode;
         const codeBlock = document.createElement('div');
@@ -292,7 +291,6 @@ function renderMarkdown(element, content) {
         codeBlock.appendChild(pre.cloneNode(true));
         pre.parentNode.replaceChild(codeBlock, pre);
 
-        // 代码块复制功能
         codeCopyBtn.addEventListener('click', () => {
             const text = codeBlock.querySelector('code').textContent;
             navigator.clipboard.writeText(text).then(() => {
@@ -308,13 +306,14 @@ function renderMarkdown(element, content) {
         });
     });
 
-    // 渲染数学公式
-    renderMathInElement(element, {
-        delimiters: [
-            {left: '$$', right: '$$', display: true},
-            {left: '$', right: '$', display: false}
-        ]
-    });
+    if (typeof renderMathInElement === 'function') {
+        renderMathInElement(element, {
+            delimiters: [
+                {left: '$$', right: '$$', display: true},
+                {left: '$', right: '$', display: false}
+            ]
+        });
+    }
 }
 
 function updateBubbleCopyButton(msgDiv) {
@@ -344,7 +343,6 @@ async function handleCopyButton(button, text) {
     }
 }
 
-// 输入框高度自适应(有最大高度，超出出现滚动条)
 const maxHeight = 200;
 promptInput.addEventListener('input', function() {
     this.style.height = 'auto';

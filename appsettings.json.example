@@ -43,6 +43,18 @@
         "TPM": 32000,
         "RPD": 50,
         "FallbackModel": "gemini-1.5-flash"
+      },
+      "gemini-exp-1206": {
+        "RPM": 2,
+        "TPM": 32000,
+        "RPD": 50,
+        "FallbackModel": "gemini-1.5-flash"
+      },
+      "learnlm-1.5-pro-experimental": {
+        "RPM": 2,
+        "TPM": 32000,
+        "RPD": 50,
+        "FallbackModel": "gemini-1.5-flash"
       }
     }
   }

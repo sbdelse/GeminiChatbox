@@ -8,6 +8,7 @@
 
   <ItemGroup>
     <PackageReference Include="Serilog.AspNetCore" Version="8.0.3" />
+	<Content Include="appsettings.json.example" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

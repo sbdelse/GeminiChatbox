@@ -88,6 +88,7 @@ async function sendMessage() {
     }
 
     promptInput.value = '';
+    promptInput.style.height = 'auto';
     imageInput.value = '';
     let aiMessage = '';
 

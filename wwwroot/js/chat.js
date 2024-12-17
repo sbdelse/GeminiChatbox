@@ -33,10 +33,14 @@ const output = document.getElementById('output');
 const modelSelect = document.getElementById('modelSelect');
 const imageInput = document.getElementById('imageInput');
 const clearBtn = document.getElementById('clearBtn');
+const pasteBtn = document.getElementById('pasteBtn');
+const clearFilesBtn = document.getElementById('clearFilesBtn');
+const exportBtn = document.getElementById('exportBtn');
 
 let chatHistory = [];
 let isLoading = false;
 let autoScroll = true;
+let messageModels = [];
 
 output.addEventListener('scroll', () => {
     const distanceToBottom = output.scrollHeight - output.scrollTop - output.clientHeight;
@@ -143,6 +147,7 @@ async function sendMessage() {
 
         if (aiMessage) {
             chatHistory.push({ role: "model", Content: aiMessage });
+            messageModels.push(modelSelect.options[modelSelect.selectedIndex].text);
         }
     } catch (error) {
         console.error('Error:', error);
@@ -354,4 +359,122 @@ promptInput.addEventListener('input', function() {
     } else {
         this.style.overflowY = 'hidden';
     }
+});
+
+function handlePaste(event) {
+    const items = (event.clipboardData || event.originalEvent.clipboardData).items;
+    
+    for (const item of items) {
+        if (item.type.indexOf('image') === 0) {
+            const blob = item.getAsFile();
+            const file = new File([blob], `pasted-image-${Date.now()}.png`, { type: blob.type });
+            
+            const dataTransfer = new DataTransfer();
+            
+            if (imageInput.files.length > 0) {
+                Array.from(imageInput.files).forEach(existingFile => {
+                    dataTransfer.items.add(existingFile);
+                });
+            }
+            
+            dataTransfer.items.add(file);
+            imageInput.files = dataTransfer.files;
+            
+            const filesPreview = document.querySelector('.files-preview') || document.createElement('div');
+            filesPreview.classList.add('files-preview');
+            filesPreview.appendChild(createFilePreview(file));
+            
+            event.preventDefault();
+        }
+    }
+}
+
+document.addEventListener('paste', handlePaste);
+pasteBtn.addEventListener('click', () => {
+    navigator.clipboard.read().then(async items => {
+        for (const item of items) {
+            for (const type of item.types) {
+                if (type.startsWith('image/')) {
+                    const blob = await item.getType(type);
+                    const file = new File([blob], `pasted-image-${Date.now()}.png`, { type });
+                    
+                    const dataTransfer = new DataTransfer();
+                    
+                    if (imageInput.files.length > 0) {
+                        Array.from(imageInput.files).forEach(existingFile => {
+                            dataTransfer.items.add(existingFile);
+                        });
+                    }
+                    
+                    dataTransfer.items.add(file);
+                    imageInput.files = dataTransfer.files;
+                }
+            }
+        }
+    }).catch(err => {
+        console.error('Failed to read clipboard:', err);
+    });
+});
+
+clearFilesBtn.addEventListener('click', () => {
+    imageInput.value = '';
+    const filesPreview = document.querySelector('.files-preview');
+    if (filesPreview) {
+        filesPreview.remove();
+    }
+});
+
+exportBtn.addEventListener('click', async () => {
+    const messages = Array.from(output.children);
+    let markdown = `# Chat History\n\nDate: ${new Date().toLocaleString()}\n\n---\n\n`;
+    let modelIndex = 0;
+    
+    for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+        const isUser = msg.classList.contains('user');
+        const bubble = msg.querySelector('.bubble');
+        const content = bubble.querySelector('.message-content');
+        const filesPreview = bubble.querySelector('.files-preview');
+        
+        if (isUser) {
+            markdown += '**User**:\n';
+        } else {
+            markdown += `**Assistant** (${messageModels[modelIndex++]}):\n`;
+        }
+        
+        markdown += content.innerText + '\n\n';
+        
+        if (filesPreview) {
+            const images = filesPreview.querySelectorAll('.preview-image');
+            for (const img of images) {
+                try {
+                    const response = await fetch(img.src);
+                    const blob = await response.blob();
+                    const base64 = await new Promise((resolve) => {
+                        const reader = new FileReader();
+                        reader.onloadend = () => resolve(reader.result);
+                        reader.readAsDataURL(blob);
+                    });
+                    
+                    markdown += `![Uploaded Image](${base64})\n`;
+                } catch (error) {
+                    console.error('Error converting image to base64:', error);
+                    markdown += `![Uploaded Image](${img.src})\n`;
+                }
+            }
+            markdown += '\n';
+        }
+        
+        markdown += '---\n\n';
+    }
+    
+    const blob = new Blob([markdown], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `chat-history-${new Date().toISOString().slice(0,10)}.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
 });

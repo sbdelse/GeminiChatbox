@@ -5,7 +5,7 @@
 }
 
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-Hans-CN">
 <head>
     <meta charset="utf-8" />
     <title>@ViewData["Title"]</title>
@@ -25,15 +25,26 @@
 <body>
     <div class="chat-container">
         <div class="chat-header">
-            <h1 class="h1 mb-0">Gemini Chat Box</h1>
-            <div class="chat-controls">
-                <select id="modelSelect" class="form-select">
-                    @foreach (var modelItem in Model.AvailableModels)
-                    {
-                        <option value="@modelItem.Value">@modelItem.Text</option>
-                    }
-                </select>
-                <button id="clearBtn" class="btn btn-outline-secondary">清空</button>
+            <div class="title-row">
+                <h1>Gemini Chat Box</h1>
+            </div>
+            <div class="controls-row">
+                <div class="controls-left">
+                    <select id="modelSelect" class="form-select">
+                        @foreach (var modelItem in Model.AvailableModels)
+                        {
+                            <option value="@modelItem.Value">@modelItem.Text</option>
+                        }
+                    </select>
+                </div>
+                <div class="controls-right">
+                    <button id="exportBtn" class="btn btn-outline-secondary">
+                        <i class="fas fa-download"></i> 导出为Markdown
+                    </button>
+                    <button id="clearBtn" class="btn btn-outline-secondary">
+                        <i class="fas fa-trash"></i> 清空全部
+                    </button>
+                </div>
             </div>
         </div>
 
@@ -48,7 +59,15 @@
             </div>
             <div class="mt-2">
                 <label for="imageInput" class="form-label">上传图片或文件 (可选):</label>
-                <input type="file" id="imageInput" class="form-control" multiple accept="image/jpeg,image/png,image/webp,image/heic,image/heif,application/pdf,application/x-javascript,text/javascript,application/x-python,text/x-python,text/plain,text/html,text/css,text/md,text/csv,text/xml,text/rtf">
+                <div class="input-group">
+                    <input type="file" id="imageInput" class="form-control" multiple accept="image/jpeg,image/png,image/webp,image/heic,image/heif,application/pdf,application/x-javascript,text/javascript,application/x-python,text/x-python,text/plain,text/html,text/css,text/md,text/csv,text/xml,text/rtf">
+                    <button id="pasteBtn" class="btn btn-outline-secondary" title="从剪贴板粘贴">
+                        <i class="fas fa-paste"></i>
+                    </button>
+                    <button id="clearFilesBtn" class="btn btn-outline-secondary" title="清空文件">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
             </div>
         </div>
     </div>

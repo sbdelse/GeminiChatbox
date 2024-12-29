@@ -36,6 +36,10 @@ const clearBtn = document.getElementById('clearBtn');
 const pasteBtn = document.getElementById('pasteBtn');
 const clearFilesBtn = document.getElementById('clearFilesBtn');
 const exportBtn = document.getElementById('exportBtn');
+const chatSidebar = document.getElementById('chatSidebar');
+const sidebarToggle = document.getElementById('sidebarToggle');
+const sidebarOverlay = document.getElementById('sidebarOverlay');
+const chatIndexList = document.getElementById('chatIndexList');
 
 let chatHistory = [];
 let isLoading = false;
@@ -55,16 +59,18 @@ document.addEventListener('DOMContentLoaded', function() {
     const chatHeader = document.querySelector('.chat-header');
     const chatControls = document.querySelector('.chat-controls');
     
-    function moveButton() {
-        if (window.innerWidth <= 768) {
-            chatHeader.appendChild(clearBtn);
-        } else {
-            chatControls.appendChild(clearBtn);
+    if (clearBtn && chatHeader && chatControls) {
+        function moveButton() {
+            if (window.innerWidth <= 768) {
+                chatHeader.appendChild(clearBtn);
+            } else {
+                chatControls.appendChild(clearBtn);
+            }
         }
+        
+        moveButton();
+        window.addEventListener('resize', moveButton);
     }
-    
-    moveButton();
-    window.addEventListener('resize', moveButton);
 });
 
 async function sendMessage() {
@@ -148,6 +154,7 @@ async function sendMessage() {
         if (aiMessage) {
             chatHistory.push({ role: "model", Content: aiMessage });
             messageModels.push(modelSelect.options[modelSelect.selectedIndex].text);
+            updateChatIndex(aiMessage, 'ai');
         }
     } catch (error) {
         console.error('Error:', error);
@@ -195,14 +202,26 @@ function addMessage(content, type) {
 
     const bubble = document.createElement('div');
     bubble.classList.add('bubble');
+    
+    // Add special styling for system messages and errors
+    if (content.startsWith('[System]')) {
+        bubble.classList.add('system-message');
+        type = 'system';
+    } else if (content.startsWith('[Error]')) {
+        bubble.classList.add('error-message');
+        type = 'error';
+    }
+    
     bubble.style.position = 'relative';
+    
+    bubble.dataset.originalContent = content;
 
     const copyBtn = document.createElement('button');
     copyBtn.classList.add('copy-button');
     copyBtn.textContent = 'Copy';
     copyBtn.onclick = () => {
-        const messageContent = bubble.querySelector('.message-content').innerText;
-        handleCopyButton(copyBtn, messageContent);
+        const originalContent = bubble.dataset.originalContent;
+        handleCopyButton(copyBtn, originalContent);
     };
     bubble.appendChild(copyBtn);
 
@@ -229,6 +248,10 @@ function addMessage(content, type) {
 
     if (autoScroll) {
         output.scrollTop = output.scrollHeight;
+    }
+
+    if (content) {
+        updateChatIndex(content, type);
     }
 
     return contentDiv;
@@ -265,9 +288,11 @@ promptInput.addEventListener('keypress', (e) => {
 clearBtn.addEventListener('click', () => {
     output.innerHTML = '';
     chatHistory = [];
+    chatIndexList.innerHTML = '';
 });
 
 function renderMarkdown(element, content) {
+    element.closest('.bubble').dataset.originalContent = content;
     element.innerHTML = marked.parse(content);
 
     element.querySelectorAll('pre code').forEach(codeEl => {
@@ -327,9 +352,8 @@ function updateBubbleCopyButton(msgDiv) {
     const copyBtn = bubble.querySelector('.copy-button');
     if (copyBtn) {
         copyBtn.onclick = () => {
-            const markdownContent = bubble.querySelector('.markdown-content');
-            const messageContent = markdownContent ? markdownContent.innerText : bubble.querySelector('.message-content').innerText;
-            handleCopyButton(copyBtn, messageContent);
+            const originalContent = bubble.dataset.originalContent;
+            handleCopyButton(copyBtn, originalContent);
         };
     }
 }
@@ -433,7 +457,7 @@ exportBtn.addEventListener('click', async () => {
         const msg = messages[i];
         const isUser = msg.classList.contains('user');
         const bubble = msg.querySelector('.bubble');
-        const content = bubble.querySelector('.message-content');
+        const originalContent = bubble.dataset.originalContent;
         const filesPreview = bubble.querySelector('.files-preview');
         
         if (isUser) {
@@ -442,7 +466,7 @@ exportBtn.addEventListener('click', async () => {
             markdown += `**Assistant** (${messageModels[modelIndex++]}):\n`;
         }
         
-        markdown += content.innerText + '\n\n';
+        markdown += originalContent + '\n\n';
         
         if (filesPreview) {
             const images = filesPreview.querySelectorAll('.preview-image');
@@ -478,3 +502,117 @@ exportBtn.addEventListener('click', async () => {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
 });
+
+function checkSidebarVisibility() {
+    if (window.innerWidth > 1200) {
+        chatSidebar.classList.add('visible');
+    } else {
+        chatSidebar.classList.remove('visible');
+    }
+}
+
+checkSidebarVisibility();
+window.addEventListener('resize', checkSidebarVisibility);
+
+sidebarToggle.addEventListener('click', () => {
+    chatSidebar.classList.toggle('active');
+    sidebarOverlay.classList.toggle('active');
+});
+
+sidebarOverlay.addEventListener('click', () => {
+    chatSidebar.classList.remove('active');
+    sidebarOverlay.classList.remove('active');
+});
+
+function updateChatIndex(content, type) {
+    const li = document.createElement('li');
+    li.classList.add('chat-index-item', type);
+    
+    const icon = type === 'user' ? 'fa-user' : 'fa-robot';
+    const truncatedContent = content.length > 30 
+        ? content.substring(0, 30) + '...' 
+        : content;
+    
+    li.innerHTML = `
+        <div class="content">
+            <i class="fas ${icon} fa-sm" style="margin-right: 8px;"></i>
+            ${truncatedContent}
+        </div>
+    `;
+    
+    li.dataset.fullContent = content;
+    
+    li.addEventListener('click', () => {
+        const messages = output.querySelectorAll('.message');
+        for (let msg of messages) {
+            const msgContent = msg.querySelector('.message-content').textContent;
+            if (msgContent.includes(content)) {
+                output.scrollTo({
+                    top: msg.offsetTop - output.offsetTop,
+                    behavior: 'smooth'
+                });
+                
+                msg.classList.add('highlight');
+                setTimeout(() => {
+                    msg.classList.remove('highlight');
+                }, 2000);
+                break;
+            }
+        }
+        
+        if (window.innerWidth <= 1200) {
+            chatSidebar.classList.remove('active');
+            sidebarOverlay.classList.remove('active');
+        }
+    });
+    
+    chatIndexList.appendChild(li);
+}
+
+const style = document.createElement('style');
+style.textContent = `
+    .message.highlight {
+        animation: highlight 2s ease-in-out;
+    }
+    
+    @keyframes highlight {
+        0% { background: transparent; }
+        25% { background: rgba(13, 110, 253, 0.1); }
+        75% { background: rgba(13, 110, 253, 0.1); }
+        100% { background: transparent; }
+    }
+    
+    @media (prefers-color-scheme: dark) {
+        @keyframes highlight {
+            0% { background: transparent; }
+            25% { background: rgba(91, 158, 255, 0.15); }
+            75% { background: rgba(91, 158, 255, 0.15); }
+            100% { background: transparent; }
+        }
+    }
+
+    .bubble.system-message {
+        background-color: #e8f4f8;
+        border-left: 4px solid #0dcaf0;
+        color: #055160;
+    }
+
+    .bubble.error-message {
+        background-color: #f8d7da;
+        border-left: 4px solid #dc3545;
+        color: #842029;
+    }
+
+    @media (prefers-color-scheme: dark) {
+        .bubble.system-message {
+            background-color: rgba(13, 202, 240, 0.15);
+            color: #98c7d0;
+        }
+
+        .bubble.error-message {
+            background-color: rgba(220, 53, 69, 0.15);
+            color: #ea868f;
+        }
+    }
+`;
+document.head.appendChild(style);

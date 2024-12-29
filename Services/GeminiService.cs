@@ -144,115 +144,81 @@ namespace GeminiFreeSearch.Services
             List<ImageData>? images = null,
             List<DocumentData>? documents = null)
         {
-            HttpResponseMessage response;
-            try
+            var currentModel = modelName;
+            var triedModels = new HashSet<string>();
+            var errorMessages = new List<string>();
+
+            while (true)
             {
-                var finalModel = ResolveModelName(modelName);
-                var apiKey = GetNextApiKey();
-                var requestUrl = $"{_baseUrl}/models/{finalModel}:streamGenerateContent?alt=sse&key={apiKey}";
-
-                var contents = new List<object>();
-
-                // 历史记录
-                if (history != null)
+                var finalModel = ResolveModelName(currentModel);
+                if (triedModels.Contains(finalModel))
                 {
-                    foreach (var msg in history)
+                    yield return $"[Error] 所有可用模型均已尝试失败。错误信息：\n{string.Join("\n", errorMessages)}";
+                    yield break;
+                }
+
+                triedModels.Add(finalModel);
+                
+                if (triedModels.Count > 1)
+                {
+                    yield return $"[System] 正在使用备用模型 {finalModel} 重试请求...\n";
+                }
+
+                var (success, response, error) = await TryExecuteStreamRequest(
+                    finalModel, prompt, history, images, documents);
+
+                if (!success || response == null)
+                {
+                    errorMessages.Add(error);
+                    if (!TryGetFallbackModel(currentModel, out var fallbackModel))
                     {
-                        contents.Add(new
-                        {
-                            role = msg.Role,
-                            parts = new[]
-                            {
-                                new { text = msg.Content }
-                            }
-                        });
+                        yield return $"[Error] {error}\n没有可用的备用模型。";
+                        yield break;
                     }
+                    currentModel = fallbackModel;
+                    continue;
                 }
 
-                // 构建用户请求部分
-                var partsList = new List<object>();
-
-                // 图片 inline_data
-                if (images != null && images.Count > 0)
-                {
-                    foreach (var img in images)
-                    {
-                        partsList.Add(new
-                        {
-                            inline_data = new
-                            {
-                                mime_type = img.MimeType,
-                                data = img.Data
-                            }
-                        });
-                    }
-                }
-
-                // 文档 file_data
-                // 将多个文档全部列在此 parts 中
-                if (documents != null && documents.Count > 0)
-                {
-                    foreach (var doc in documents)
-                    {
-                        partsList.Add(new
-                        {
-                            file_data = new
-                            {
-                                mime_type = doc.MimeType,
-                                file_uri = doc.FileUri
-                            }
-                        });
-                    }
-                }
-
-                // 文本提示
-                if (!string.IsNullOrEmpty(prompt))
-                {
-                    partsList.Add(new
-                    {
-                        text = prompt
-                    });
-                }
-
-                contents.Add(new
-                {
-                    role = "user",
-                    parts = partsList.ToArray()
-                });
-
-                var requestBody = new { contents = contents.ToArray() };
-                var json = JsonSerializer.Serialize(requestBody);
-                var requestContent = new StringContent(json, Encoding.UTF8, "application/json");
-
-                using var requestMessage = new HttpRequestMessage(HttpMethod.Post, requestUrl)
-                {
-                    Content = requestContent
-                };
-
-                response = await ExecuteWithRetryAsync(async () => 
-                {
-                    var resp = await _httpClient.SendAsync(requestMessage, HttpCompletionOption.ResponseHeadersRead);
-                    resp.EnsureSuccessStatusCode();
-                    return resp;
-                }, "StreamGenerateContent");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error in StreamGenerateContentAsync");
-                throw new GeminiException("Failed to generate content", ex);
-            }
-
-            using (response)
-            {
-                await foreach (var chunk in ProcessStreamAsync(response))
+                // 处理成功的响应
+                await foreach (var chunk in ProcessStreamResponse(response))
                 {
                     yield return chunk;
                 }
+                break;
             }
         }
 
-        private async IAsyncEnumerable<string> ProcessStreamAsync(HttpResponseMessage response)
+        private async Task<(bool success, HttpResponseMessage? response, string error)> TryExecuteStreamRequest(
+            string modelName,
+            string? prompt,
+            List<ChatMessage>? history,
+            List<ImageData>? images,
+            List<DocumentData>? documents)
         {
+            try 
+            {
+                var response = await ExecuteStreamRequest(modelName, prompt, history, images, documents);
+                return (true, response, string.Empty);
+            }
+            catch (HttpRequestException ex)
+            {
+                var statusCode = ex.StatusCode;
+                var error = $"模型 {modelName} 请求失败 (HTTP {(int?)statusCode}): {ex.Message}";
+                _logger.LogError(ex, error);
+                return (false, null, error);
+            }
+            catch (Exception ex)
+            {
+                var error = $"模型 {modelName} 发生意外错误: {ex.Message}";
+                _logger.LogError(ex, error);
+                return (false, null, error);
+            }
+        }
+
+        private async IAsyncEnumerable<string> ProcessStreamResponse(HttpResponseMessage response)
+        {
+            ArgumentNullException.ThrowIfNull(response);
+
             using var responseStream = await response.Content.ReadAsStreamAsync();
             using var reader = new StreamReader(responseStream);
 
@@ -287,6 +253,125 @@ namespace GeminiFreeSearch.Services
                     }
                 }
             }
+        }
+
+        private bool TryGetFallbackModel(string? currentModel, out string fallbackModel)
+        {
+            fallbackModel = string.Empty;
+            
+            if (string.IsNullOrEmpty(currentModel))
+            {
+                return false;
+            }
+
+            // 检查当前模型是否有直接的 fallback
+            if (_models.TryGetValue(currentModel, out var config) && 
+                !string.IsNullOrEmpty(config.FallbackModel))
+            {
+                fallbackModel = config.FallbackModel;
+                return true;
+            }
+
+            return false;
+        }
+
+        private async Task<HttpResponseMessage> ExecuteStreamRequest(
+            string modelName,
+            string? prompt,
+            List<ChatMessage>? history,
+            List<ImageData>? images,
+            List<DocumentData>? documents)
+        {
+            var apiKey = GetNextApiKey();
+            var requestUrl = $"{_baseUrl}/models/{modelName}:streamGenerateContent?alt=sse&key={apiKey}";
+
+            var contents = new List<object>();
+
+            // Add history if present
+            if (history != null)
+            {
+                foreach (var msg in history)
+                {
+                    contents.Add(new
+                    {
+                        role = msg.Role,
+                        parts = new[]
+                        {
+                            new { text = msg.Content }
+                        }
+                    });
+                }
+            }
+
+            // Build user request parts
+            var partsList = new List<object>();
+
+            // Add images if present
+            if (images?.Count > 0)
+            {
+                foreach (var img in images)
+                {
+                    partsList.Add(new
+                    {
+                        inline_data = new
+                        {
+                            mime_type = img.MimeType,
+                            data = img.Data
+                        }
+                    });
+                }
+            }
+
+            // Add documents if present
+            if (documents?.Count > 0)
+            {
+                foreach (var doc in documents)
+                {
+                    partsList.Add(new
+                    {
+                        file_data = new
+                        {
+                            mime_type = doc.MimeType,
+                            file_uri = doc.FileUri
+                        }
+                    });
+                }
+            }
+
+            // Add text prompt if present
+            if (!string.IsNullOrEmpty(prompt))
+            {
+                partsList.Add(new
+                {
+                    text = prompt
+                });
+            }
+
+            contents.Add(new
+            {
+                role = "user",
+                parts = partsList.ToArray()
+            });
+
+            var requestBody = new { contents = contents.ToArray() };
+            var json = JsonSerializer.Serialize(requestBody);
+            var requestContent = new StringContent(json, Encoding.UTF8, "application/json");
+
+            using var requestMessage = new HttpRequestMessage(HttpMethod.Post, requestUrl)
+            {
+                Content = requestContent
+            };
+
+            var response = await ExecuteWithRetryAsync(async () =>
+            {
+                var resp = await _httpClient.SendAsync(
+                    requestMessage, 
+                    HttpCompletionOption.ResponseHeadersRead);
+                resp.EnsureSuccessStatusCode();
+                return resp;
+            }, "StreamGenerateContent");
+
+            return response;
         }
 
         // 上传文档到 File API

@@ -23,6 +23,16 @@
     <link rel="icon" type="image/svg+xml" href="~/favicon.svg" sizes="any" />
 </head>
 <body>
+    <button class="sidebar-toggle" id="sidebarToggle">
+        <i class="fas fa-list"></i>
+    </button>
+
+    <div class="sidebar-overlay" id="sidebarOverlay"></div>
+    <div class="chat-sidebar" id="chatSidebar">
+        <div class="sidebar-title">对话目录</div>
+        <ul class="chat-index-list" id="chatIndexList"></ul>
+    </div>
+
     <div class="chat-container">
         <div class="chat-header">
             <div class="title-row">

@@ -74,6 +74,24 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 });
 
+document.addEventListener('DOMContentLoaded', function() {
+    const lastSelectedModel = localStorage.getItem('selectedModel');
+    
+    if (lastSelectedModel) {
+        const modelExists = Array.from(modelSelect.options).some(option => option.value === lastSelectedModel);
+        
+        if (modelExists) {
+            modelSelect.value = lastSelectedModel;
+        } else {
+            localStorage.removeItem('selectedModel');
+        }
+    }
+});
+
+modelSelect.addEventListener('change', function() {
+    localStorage.setItem('selectedModel', this.value);
+});
+
 async function sendMessage() {
     const prompt = promptInput.value.trim();
     const model = modelSelect.value;
@@ -507,6 +525,7 @@ exportBtn.addEventListener('click', async () => {
 function checkSidebarVisibility() {
     if (window.innerWidth > 1200) {
         chatSidebar.classList.add('visible');
+        sidebarOverlay.classList.remove('active');
     } else {
         chatSidebar.classList.remove('visible');
     }
@@ -518,11 +537,13 @@ window.addEventListener('resize', checkSidebarVisibility);
 sidebarToggle.addEventListener('click', () => {
     chatSidebar.classList.toggle('active');
     sidebarOverlay.classList.toggle('active');
+    document.body.style.overflow = chatSidebar.classList.contains('active') ? 'hidden' : '';
 });
 
 sidebarOverlay.addEventListener('click', () => {
     chatSidebar.classList.remove('active');
     sidebarOverlay.classList.remove('active');
+    document.body.style.overflow = '';
 });
 
 function updateChatIndex(content, type) {

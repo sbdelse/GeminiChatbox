@@ -40,6 +40,7 @@ const chatSidebar = document.getElementById('chatSidebar');
 const sidebarToggle = document.getElementById('sidebarToggle');
 const sidebarOverlay = document.getElementById('sidebarOverlay');
 const chatIndexList = document.getElementById('chatIndexList');
+const cameraBtn = document.getElementById('cameraBtn');
 
 let chatHistory = [];
 let isLoading = false;
@@ -616,3 +617,43 @@ style.textContent = `
     }
 `;
 document.head.appendChild(style);
+
+cameraBtn.addEventListener('click', () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        const cameraInput = document.createElement('input');
+        cameraInput.type = 'file';
+        cameraInput.accept = 'image/*';
+        cameraInput.capture = 'environment';
+        
+        cameraInput.addEventListener('change', handleCameraCapture);
+        cameraInput.click();
+        return;
+    }
+
+    const cameraInput = document.createElement('input');
+    cameraInput.type = 'file';
+    cameraInput.accept = 'image/*';
+    cameraInput.capture = 'environment';
+    
+    cameraInput.addEventListener('change', handleCameraCapture);
+    cameraInput.click();
+});
+
+function handleCameraCapture(event) {
+    if (event.target.files && event.target.files[0]) {
+        const dataTransfer = new DataTransfer();
+
+        if (imageInput.files.length > 0) {
+            Array.from(imageInput.files).forEach(existingFile => {
+                dataTransfer.items.add(existingFile);
+            });
+        }
+
+        dataTransfer.items.add(event.target.files[0]);
+        imageInput.files = dataTransfer.files;
+
+        const filesPreview = document.querySelector('.files-preview') || document.createElement('div');
+        filesPreview.classList.add('files-preview');
+        filesPreview.appendChild(createFilePreview(event.target.files[0]));
+    }
+}

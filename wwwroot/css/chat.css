@@ -1,4 +1,14 @@
-/* 整体容器美化 */
+* {
+    font-family: 'Poppins', 'Noto Sans SC', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    font-size: 16px;
+}
+
+@media (max-width: 768px) {
+    * {
+        font-size: 14px;
+    }
+}
+
 body {
     background: #f0f2f5;
     font-family: 'Poppins', 'Noto Sans SC', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
@@ -468,10 +478,6 @@ p {
         margin-top: auto; /* 确保输入区域始终底部 */
     }
 
-    #promptInput {
-        font-size: 16px; /* 防止iOS自动缩放 */
-    }
-
     .code-block {
         margin: 0.5rem 0;
     }
@@ -781,4 +787,28 @@ p {
         background: #2d2d2d;
         color: #e0e0e0;
     }
+}
+
+.footer .text-muted {
+    font-size: 0.7rem;
+}
+
+.friend-links {
+    margin-top: 0.2rem;
+}
+
+.friend-links a {
+    margin: 0 0.3rem;
+}
+
+.friend-links a:first-child {
+    margin-left: 0;
+}
+
+.friend-links a:last-child {
+    margin-right: 0;
+}
+
+a {
+    font-size: inherit;
 }

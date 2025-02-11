@@ -84,17 +84,31 @@ namespace GeminiFreeSearch.Services
 
         private string GetNextApiKey()
         {
+            return GetCurrentApiKey();
+        }
+
+        private string GetCurrentApiKey()
+        {
             lock (_lockObject)
             {
-                var key = _apiKeys[_currentKeyIndex];
+                return _apiKeys[_currentKeyIndex];
+            }
+        }
+
+        private void RotateToNextKey()
+        {
+            lock (_lockObject)
+            {
                 _currentKeyIndex = (_currentKeyIndex + 1) % _apiKeys.Length;
-                return key;
             }
         }
 
         private async Task<T> ExecuteWithRetryAsync<T>(Func<Task<T>> action, string operationName)
         {
-            for (int i = 0; i < MaxRetries; i++)
+            var triedKeys = new HashSet<string>();
+            var lastKey = string.Empty;
+
+            while (triedKeys.Count < _apiKeys.Length)
             {
                 try
                 {
@@ -102,22 +116,40 @@ namespace GeminiFreeSearch.Services
                 }
                 catch (HttpRequestException ex) when (IsTransientError(ex))
                 {
-                    if (i == MaxRetries - 1) throw;
+                    if (triedKeys.Count == _apiKeys.Length - 1) throw;
                     
-                    var delay = RetryDelays[i];
+                    var delay = RetryDelays[Math.Min(triedKeys.Count, RetryDelays.Length - 1)];
                     _logger.LogWarning(ex, 
-                        "Attempt {Attempt} failed for {Operation}. Retrying in {Delay} seconds", 
-                        i + 1, operationName, delay.TotalSeconds);
+                        "Attempt failed for {Operation}. Retrying in {Delay} seconds", 
+                        operationName, delay.TotalSeconds);
                     
                     await Task.Delay(delay);
                 }
                 catch (Exception ex) when (IsRateLimitError(ex))
                 {
-                    _logger.LogError(ex, "Rate limit exceeded for {Operation}", operationName);
-                    throw new GeminiRateLimitException("API rate limit exceeded. Please try again later.");
+                    var currentKey = GetCurrentApiKey();
+                    if (!triedKeys.Contains(currentKey))
+                    {
+                        triedKeys.Add(currentKey);
+                    }
+
+                    if (triedKeys.Count >= _apiKeys.Length)
+                    {
+                        _logger.LogError(ex, "All API keys have reached rate limit for {Operation}", operationName);
+                        throw new GeminiRateLimitException("All API keys have reached rate limit. Please try again later.");
+                    }
+
+                    _logger.LogWarning("Rate limit reached for key {KeyIndex}, switching to next key", _currentKeyIndex);
+                    while (triedKeys.Contains(GetCurrentApiKey()))
+                    {
+                        RotateToNextKey();
+                    }
+
+                    continue;
                 }
             }
-            throw new GeminiException($"Operation {operationName} failed after {MaxRetries} attempts");
+            
+            throw new GeminiException($"Operation {operationName} failed after trying all API keys");
         }
 
         private bool IsTransientError(HttpRequestException ex)

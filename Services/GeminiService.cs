@@ -84,7 +84,11 @@ namespace GeminiFreeSearch.Services
 
         private string GetNextApiKey()
         {
-            return GetCurrentApiKey();
+            lock (_lockObject)
+            {
+                _currentKeyIndex = (_currentKeyIndex + 1) % _apiKeys.Length;
+                return _apiKeys[_currentKeyIndex];
+            }
         }
 
         private string GetCurrentApiKey()
@@ -92,14 +96,6 @@ namespace GeminiFreeSearch.Services
             lock (_lockObject)
             {
                 return _apiKeys[_currentKeyIndex];
-            }
-        }
-
-        private void RotateToNextKey()
-        {
-            lock (_lockObject)
-            {
-                _currentKeyIndex = (_currentKeyIndex + 1) % _apiKeys.Length;
             }
         }
 
@@ -142,7 +138,7 @@ namespace GeminiFreeSearch.Services
                     _logger.LogWarning("Rate limit reached for key {KeyIndex}, switching to next key", _currentKeyIndex);
                     while (triedKeys.Contains(GetCurrentApiKey()))
                     {
-                        RotateToNextKey();
+                        GetNextApiKey();
                     }
 
                     continue;
@@ -389,21 +385,19 @@ namespace GeminiFreeSearch.Services
             var json = JsonSerializer.Serialize(requestBody);
             var requestContent = new StringContent(json, Encoding.UTF8, "application/json");
 
-            using var requestMessage = new HttpRequestMessage(HttpMethod.Post, requestUrl)
+            return await ExecuteWithRetryAsync(async () =>
             {
-                Content = requestContent
-            };
-
-            var response = await ExecuteWithRetryAsync(async () =>
-            {
+                using var newRequestMessage = new HttpRequestMessage(HttpMethod.Post, requestUrl)
+                {
+                    Content = requestContent
+                };
+                
                 var resp = await _httpClient.SendAsync(
-                    requestMessage, 
+                    newRequestMessage, 
                     HttpCompletionOption.ResponseHeadersRead);
                 resp.EnsureSuccessStatusCode();
                 return resp;
             }, "StreamGenerateContent");
-
-            return response;
         }
 
         // 上传文档到 File API

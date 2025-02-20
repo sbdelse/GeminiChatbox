@@ -192,27 +192,49 @@ namespace GeminiFreeSearch.Services
                     yield return $"[System] 正在使用备用模型 {finalModel} 重试请求...\n";
                 }
 
-                var (success, response, error) = await TryExecuteStreamRequest(
-                    finalModel, prompt, history, images, documents);
-
-                if (!success || response == null)
+                // Try all API keys with current model first
+                var allKeysTried = false;
+                var triedKeys = new HashSet<string>();
+                
+                while (!allKeysTried)
                 {
-                    errorMessages.Add(error);
-                    if (!TryGetFallbackModel(currentModel, out var fallbackModel))
+                    var (success, response, error) = await TryExecuteStreamRequest(
+                        finalModel, prompt, history, images, documents);
+
+                    if (success && response != null)
                     {
-                        yield return $"[Error] {error}\n没有可用的备用模型。";
+                        // Process successful response
+                        await foreach (var chunk in ProcessStreamResponse(response))
+                        {
+                            yield return chunk;
+                        }
                         yield break;
                     }
-                    currentModel = fallbackModel;
-                    continue;
+
+                    var currentKey = GetCurrentApiKey();
+                    triedKeys.Add(currentKey);
+                    
+                    if (triedKeys.Count >= _apiKeys.Length)
+                    {
+                        allKeysTried = true;
+                        errorMessages.Add(error);
+                    }
+                    else
+                    {
+                        // Try next key with same model
+                        GetNextApiKey();
+                        yield return $"[System] 正在使用下一个API密钥重试请求...\n";
+                        continue;
+                    }
                 }
 
-                // 处理成功的响应
-                await foreach (var chunk in ProcessStreamResponse(response))
+                // If all keys failed, try fallback model
+                if (!TryGetFallbackModel(currentModel, out var fallbackModel))
                 {
-                    yield return chunk;
+                    yield return $"[Error] {string.Join("\n", errorMessages)}\n没有可用的备用模型。";
+                    yield break;
                 }
-                break;
+                currentModel = fallbackModel;
             }
         }
 

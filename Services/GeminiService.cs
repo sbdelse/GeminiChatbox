@@ -175,12 +175,14 @@ namespace GeminiFreeSearch.Services
             var currentModel = modelName;
             var triedModels = new HashSet<string>();
             var errorMessages = new List<string>();
+            var responseChunks = new List<string>();
 
             while (true)
             {
                 var finalModel = ResolveModelName(currentModel);
                 if (triedModels.Contains(finalModel))
                 {
+                    // Return error message without using yield in exception context
                     yield return $"[Error] 所有可用模型均已尝试失败。错误信息：\n{string.Join("\n", errorMessages)}";
                     yield break;
                 }
@@ -198,18 +200,46 @@ namespace GeminiFreeSearch.Services
                 
                 while (!allKeysTried)
                 {
+                    // Capture response outside of try/catch to avoid yield in exception context
                     var result = await TryExecuteStreamRequest(
                         finalModel, prompt, history, images, documents);
                     
-                    if (result.success && result.response != null)
+                    bool success = result.success;
+                    HttpResponseMessage? response = result.response;
+                    string error = result.error;
+
+                    if (success && response != null)
                     {
                         // Process successful response
-                        var chunks = await ProcessStreamResponseToList(result.response);
-                        foreach (var chunk in chunks)
+                        responseChunks.Clear();
+                        bool processingSucceeded = true;
+                        string processingError = string.Empty;
+                        
+                        try
                         {
-                            yield return chunk;
+                            // Process the stream without using yield in try/catch
+                            await foreach (var chunk in ProcessStreamResponse(response))
+                            {
+                                responseChunks.Add(chunk);
+                            }
                         }
-                        yield break;
+                        catch (Exception ex)
+                        {
+                            processingSucceeded = false;
+                            _logger.LogError(ex, "Error processing stream response from model {Model}", finalModel);
+                            processingError = $"处理响应时出错: {ex.Message}";
+                            error = processingError;
+                        }
+                        
+                        if (processingSucceeded)
+                        {
+                            // Now yield the chunks outside the try/catch
+                            foreach (var chunk in responseChunks)
+                            {
+                                yield return chunk;
+                            }
+                            yield break;
+                        }
                     }
 
                     var currentKey = GetCurrentApiKey();
@@ -218,7 +248,7 @@ namespace GeminiFreeSearch.Services
                     if (triedKeys.Count >= _apiKeys.Length)
                     {
                         allKeysTried = true;
-                        errorMessages.Add(result.error);
+                        errorMessages.Add(error);
                     }
                     else
                     {
@@ -254,21 +284,15 @@ namespace GeminiFreeSearch.Services
             catch (HttpRequestException ex)
             {
                 var statusCode = ex.StatusCode;
-                var errorContent = string.Empty;
-                
-                // Try to extract more detailed error information if available
-                if (ex.Data.Contains("ResponseContent"))
-                {
-                    errorContent = ex.Data["ResponseContent"] as string ?? string.Empty;
-                }
-                
                 var error = $"模型 {modelName} 请求失败 (HTTP {(int?)statusCode}): {ex.Message}";
-                if (!string.IsNullOrEmpty(errorContent))
+                _logger.LogError(ex, error);
+                
+                // Handle 400 Bad Request errors specifically
+                if (statusCode == System.Net.HttpStatusCode.BadRequest)
                 {
-                    error += $"\n详细错误: {errorContent}";
+                    error = $"模型 {modelName} 请求参数错误 (HTTP 400): 可能是模型名称无效或请求格式不正确";
                 }
                 
-                _logger.LogError(ex, error);
                 return (false, null, error);
             }
             catch (Exception ex)
@@ -279,77 +303,6 @@ namespace GeminiFreeSearch.Services
             }
         }
 
-        private async Task<List<string>> ProcessStreamResponseToList(HttpResponseMessage response)
-        {
-            ArgumentNullException.ThrowIfNull(response);
-            var result = new List<string>();
-
-            using var responseStream = await response.Content.ReadAsStreamAsync();
-            using var reader = new StreamReader(responseStream);
-
-            while (!reader.EndOfStream)
-            {
-                var line = await reader.ReadLineAsync();
-                if (string.IsNullOrWhiteSpace(line)) continue;
-                if (!line.StartsWith("data:")) continue;
-
-                var jsonLine = line["data:".Length..].Trim();
-                if (string.IsNullOrEmpty(jsonLine)) continue;
-
-                try
-                {
-                    using var doc = JsonDocument.Parse(jsonLine);
-                    if (!doc.RootElement.TryGetProperty("candidates", out var candidates) ||
-                        candidates.ValueKind != JsonValueKind.Array ||
-                        candidates.GetArrayLength() == 0) continue;
-
-                    var firstCandidate = candidates[0];
-                    if (!firstCandidate.TryGetProperty("content", out var contentObj) ||
-                        !contentObj.TryGetProperty("parts", out var parts) ||
-                        parts.ValueKind != JsonValueKind.Array) continue;
-
-                    foreach (var part in parts.EnumerateArray())
-                    {
-                        if (part.TryGetProperty("text", out var textElement))
-                        {
-                            var textChunk = textElement.GetString();
-                            if (!string.IsNullOrEmpty(textChunk))
-                            {
-                                result.Add(textChunk);
-                            }
-                        }
-                    }
-                }
-                catch (JsonException ex)
-                {
-                    _logger.LogError(ex, "Error parsing JSON response: {JsonLine}", jsonLine);
-                    result.Add($"[Error] JSON解析错误: {ex.Message}");
-                }
-            }
-
-            return result;
-        }
-
-        private bool TryGetFallbackModel(string? currentModel, out string fallbackModel)
-        {
-            fallbackModel = string.Empty;
-            
-            if (string.IsNullOrEmpty(currentModel))
-            {
-                return false;
-            }
-
-            // 检查当前模型是否有直接的 fallback
-            if (_models.TryGetValue(currentModel, out var config) && 
-                !string.IsNullOrEmpty(config.FallbackModel))
-            {
-                fallbackModel = config.FallbackModel;
-                return true;
-            }
-
-            return false;
-        }
-
         private async Task<HttpResponseMessage> ExecuteStreamRequest(
             string modelName,
             string? prompt,
@@ -357,13 +310,13 @@ namespace GeminiFreeSearch.Services
             List<ImageData>? images,
             List<DocumentData>? documents)
         {
-            var apiKey = GetNextApiKey();
+            var apiKey = GetCurrentApiKey(); // Use current key first, don't immediately switch
             var requestUrl = $"{_baseUrl}/models/{modelName}:streamGenerateContent?alt=sse&key={apiKey}";
 
             var contents = new List<object>();
 
             // Add history if present
-            if (history != null)
+            if (history != null && history.Count > 0)
             {
                 foreach (var msg in history)
                 {
@@ -422,6 +375,12 @@ namespace GeminiFreeSearch.Services
                 });
             }
 
+            // Ensure we have at least one part
+            if (partsList.Count == 0)
+            {
+                partsList.Add(new { text = string.Empty });
+            }
+
             contents.Add(new
             {
                 role = "user",
@@ -431,6 +390,8 @@ namespace GeminiFreeSearch.Services
             var requestBody = new { contents = contents.ToArray() };
             var json = JsonSerializer.Serialize(requestBody);
             var requestContent = new StringContent(json, Encoding.UTF8, "application/json");
+
+            _logger.LogDebug("Request to {Model}: {Json}", modelName, json);
 
             return await ExecuteWithRetryAsync(async () =>
             {
@@ -442,34 +403,85 @@ namespace GeminiFreeSearch.Services
                 var resp = await _httpClient.SendAsync(
                     newRequestMessage, 
                     HttpCompletionOption.ResponseHeadersRead);
-                
-                try
-                {
-                    resp.EnsureSuccessStatusCode();
-                }
-                catch (HttpRequestException ex)
-                {
-                    // Capture response content for better error reporting
-                    if (resp.Content != null)
-                    {
-                        try
-                        {
-                            var errorContent = await resp.Content.ReadAsStringAsync();
-                            ex.Data["ResponseContent"] = errorContent;
-                            
-                            _logger.LogError("API Error Response: {ErrorContent}", errorContent);
-                        }
-                        catch (Exception readEx)
-                        {
-                            _logger.LogError(readEx, "Failed to read error response content");
-                        }
-                    }
-                    
-                    throw;
-                }
-                
+                resp.EnsureSuccessStatusCode();
                 return resp;
             }, "StreamGenerateContent");
+        }
+
+        private async IAsyncEnumerable<string> ProcessStreamResponse(HttpResponseMessage response)
+        {
+            ArgumentNullException.ThrowIfNull(response);
+
+            using var responseStream = await response.Content.ReadAsStreamAsync();
+            using var reader = new StreamReader(responseStream);
+            string? line = null;
+            var chunks = new List<string>();
+
+            try
+            {
+                while (!reader.EndOfStream)
+                {
+                    line = await reader.ReadLineAsync();
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    if (!line.StartsWith("data:")) continue;
+
+                    var jsonLine = line["data:".Length..].Trim();
+                    if (string.IsNullOrEmpty(jsonLine) || jsonLine == "[DONE]") continue;
+
+                    using var doc = JsonDocument.Parse(jsonLine);
+                    if (!doc.RootElement.TryGetProperty("candidates", out var candidates) ||
+                        candidates.ValueKind != JsonValueKind.Array ||
+                        candidates.GetArrayLength() == 0) continue;
+
+                    var firstCandidate = candidates[0];
+                    if (!firstCandidate.TryGetProperty("content", out var contentObj) ||
+                        !contentObj.TryGetProperty("parts", out var parts) ||
+                        parts.ValueKind != JsonValueKind.Array) continue;
+
+                    foreach (var part in parts.EnumerateArray())
+                    {
+                        if (part.TryGetProperty("text", out var textElement))
+                        {
+                            var textChunk = textElement.GetString();
+                            if (!string.IsNullOrEmpty(textChunk))
+                            {
+                                chunks.Add(textChunk);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error processing stream response line: {Line}", line);
+                throw; // Rethrow to be handled by the caller
+            }
+            
+            // Yield chunks outside the try/catch
+            foreach (var chunk in chunks)
+            {
+                yield return chunk;
+            }
+        }
+
+        private bool TryGetFallbackModel(string? currentModel, out string fallbackModel)
+        {
+            fallbackModel = string.Empty;
+            
+            if (string.IsNullOrEmpty(currentModel))
+            {
+                return false;
+            }
+
+            // 检查当前模型是否有直接的 fallback
+            if (_models.TryGetValue(currentModel, out var config) && 
+                !string.IsNullOrEmpty(config.FallbackModel))
+            {
+                fallbackModel = config.FallbackModel;
+                return true;
+            }
+
+            return false;
         }
 
         // 上传文档到 File API

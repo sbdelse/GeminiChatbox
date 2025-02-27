@@ -121,6 +121,29 @@ namespace GeminiFreeSearch.Services
                     
                     await Task.Delay(delay);
                 }
+                catch (HttpRequestException ex) when (IsModelError(ex))
+                {
+                    // 对于模型错误（如400 Bad Request），切换到下一个API密钥
+                    var currentKey = GetCurrentApiKey();
+                    if (!triedKeys.Contains(currentKey))
+                    {
+                        triedKeys.Add(currentKey);
+                    }
+
+                    if (triedKeys.Count >= _apiKeys.Length)
+                    {
+                        _logger.LogError(ex, "All API keys failed with model error for {Operation}", operationName);
+                        throw new GeminiException($"All API keys failed with model error. The model may be invalid or the request format is incorrect.");
+                    }
+
+                    _logger.LogWarning("Model error for key {KeyIndex}, switching to next key", _currentKeyIndex);
+                    while (triedKeys.Contains(GetCurrentApiKey()))
+                    {
+                        GetNextApiKey();
+                    }
+
+                    continue;
+                }
                 catch (Exception ex) when (IsRateLimitError(ex))
                 {
                     var currentKey = GetCurrentApiKey();
@@ -156,6 +179,11 @@ namespace GeminiFreeSearch.Services
                 System.Net.HttpStatusCode.RequestTimeout;
         }
 
+        private bool IsModelError(HttpRequestException ex)
+        {
+            return ex.StatusCode == System.Net.HttpStatusCode.BadRequest;
+        }
+
         private bool IsRateLimitError(Exception ex)
         {
             if (ex is HttpRequestException httpEx)
@@ -165,9 +193,10 @@ namespace GeminiFreeSearch.Services
             return false;
         }
 
-        public async IAsyncEnumerable<string> StreamGenerateContentAsync(
+        public async Task StreamGenerateContentAsync(
             string? prompt,
             string? modelName,
+            Func<string, Task> onChunkReceived,
             List<ChatMessage>? history = null,
             List<ImageData>? images = null,
             List<DocumentData>? documents = null)
@@ -178,94 +207,107 @@ namespace GeminiFreeSearch.Services
 
             while (true)
             {
-                var finalModel = ResolveModelName(currentModel);
+                string finalModel;
+                try
+                {
+                    finalModel = ResolveModelName(currentModel);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error resolving model name for {ModelName}", currentModel);
+                    await onChunkReceived($"[Error] 无法解析模型名称 {currentModel}: {ex.Message}");
+                    return;
+                }
+
                 if (triedModels.Contains(finalModel))
                 {
-                    yield return $"[Error] 所有可用模型均已尝试失败。错误信息：\n{string.Join("\n", errorMessages)}";
-                    yield break;
+                    await onChunkReceived($"[Error] 所有可用模型均已尝试失败。错误信息：\n{string.Join("\n", errorMessages)}");
+                    return;
                 }
 
                 triedModels.Add(finalModel);
                 
                 if (triedModels.Count > 1)
                 {
-                    yield return $"[System] 正在使用备用模型 {finalModel} 重试请求...\n";
+                    await onChunkReceived($"[System] 正在使用备用模型 {finalModel} 重试请求...\n");
                 }
 
-                // Try all API keys with current model first
-                var allKeysTried = false;
+                // Try all API keys with current model
                 var triedKeys = new HashSet<string>();
+                bool modelSucceeded = false;
                 
-                while (!allKeysTried)
+                while (triedKeys.Count < _apiKeys.Length && !modelSucceeded)
                 {
-                    var (success, response, error) = await TryExecuteStreamRequest(
-                        finalModel, prompt, history, images, documents);
-
-                    if (success && response != null)
-                    {
-                        // Process successful response
-                        await foreach (var chunk in ProcessStreamResponse(response))
-                        {
-                            yield return chunk;
-                        }
-                        yield break;
-                    }
-
                     var currentKey = GetCurrentApiKey();
                     triedKeys.Add(currentKey);
                     
-                    if (triedKeys.Count >= _apiKeys.Length)
+                    try
                     {
-                        allKeysTried = true;
-                        errorMessages.Add(error);
+                        var (success, response, error) = await TryExecuteStreamRequest(
+                            finalModel, prompt, history, images, documents);
+
+                        if (success && response != null)
+                        {
+                            try
+                            {
+                                await ProcessStreamResponseWithCallback(response, onChunkReceived);
+                                return; // Success, we're done
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex, "Error processing stream response from model {Model}", finalModel);
+                                errorMessages.Add($"处理 {finalModel} 响应时出错: {ex.Message}");
+                                // Continue to next key or model
+                            }
+                        }
+                        else
+                        {
+                            errorMessages.Add(error);
+                        }
                     }
-                    else
+                    catch (GeminiException ex)
                     {
-                        // Try next key with same model
+                        _logger.LogError(ex, "GeminiException with model {Model}", finalModel);
+                        errorMessages.Add($"模型 {finalModel} 错误: {ex.Message}");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Unexpected error with model {Model}", finalModel);
+                        errorMessages.Add($"模型 {finalModel} 意外错误: {ex.Message}");
+                    }
+                    
+                    // Try next key if available
+                    if (triedKeys.Count < _apiKeys.Length)
+                    {
                         GetNextApiKey();
-                        yield return $"[System] 正在使用下一个API密钥重试请求...\n";
-                        continue;
+                        await onChunkReceived($"[System] 正在使用下一个API密钥重试请求...\n");
                     }
                 }
 
-                // If all keys failed, try fallback model
-                if (!TryGetFallbackModel(currentModel, out var fallbackModel))
+                // If all keys failed with current model, try fallback model
+                try
                 {
-                    yield return $"[Error] {string.Join("\n", errorMessages)}\n没有可用的备用模型。";
-                    yield break;
+                    if (!TryGetFallbackModel(currentModel, out var fallbackModel) || 
+                        string.IsNullOrEmpty(fallbackModel))
+                    {
+                        await onChunkReceived($"[Error] {string.Join("\n", errorMessages)}\n没有可用的备用模型。");
+                        return;
+                    }
+                    
+                    currentModel = fallbackModel;
                 }
-                currentModel = fallbackModel;
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error getting fallback model for {Model}", currentModel);
+                    await onChunkReceived($"[Error] {string.Join("\n", errorMessages)}\n获取备用模型时出错: {ex.Message}");
+                    return;
+                }
             }
         }
 
-        private async Task<(bool success, HttpResponseMessage? response, string error)> TryExecuteStreamRequest(
-            string modelName,
-            string? prompt,
-            List<ChatMessage>? history,
-            List<ImageData>? images,
-            List<DocumentData>? documents)
-        {
-            try 
-            {
-                var response = await ExecuteStreamRequest(modelName, prompt, history, images, documents);
-                return (true, response, string.Empty);
-            }
-            catch (HttpRequestException ex)
-            {
-                var statusCode = ex.StatusCode;
-                var error = $"模型 {modelName} 请求失败 (HTTP {(int?)statusCode}): {ex.Message}";
-                _logger.LogError(ex, error);
-                return (false, null, error);
-            }
-            catch (Exception ex)
-            {
-                var error = $"模型 {modelName} 发生意外错误: {ex.Message}";
-                _logger.LogError(ex, error);
-                return (false, null, error);
-            }
-        }
-
-        private async IAsyncEnumerable<string> ProcessStreamResponse(HttpResponseMessage response)
+        private async Task ProcessStreamResponseWithCallback(
+            HttpResponseMessage response, 
+            Func<string, Task> onChunkReceived)
         {
             ArgumentNullException.ThrowIfNull(response);
 
@@ -298,31 +340,38 @@ namespace GeminiFreeSearch.Services
                         var textChunk = textElement.GetString();
                         if (!string.IsNullOrEmpty(textChunk))
                         {
-                            yield return textChunk;
+                            await onChunkReceived(textChunk);
                         }
                     }
                 }
             }
         }
 
-        private bool TryGetFallbackModel(string? currentModel, out string fallbackModel)
+        private async Task<(bool success, HttpResponseMessage? response, string error)> TryExecuteStreamRequest(
+            string modelName,
+            string? prompt,
+            List<ChatMessage>? history,
+            List<ImageData>? images,
+            List<DocumentData>? documents)
         {
-            fallbackModel = string.Empty;
-            
-            if (string.IsNullOrEmpty(currentModel))
+            try 
             {
-                return false;
+                var response = await ExecuteStreamRequest(modelName, prompt, history, images, documents);
+                return (true, response, string.Empty);
             }
-
-            // 检查当前模型是否有直接的 fallback
-            if (_models.TryGetValue(currentModel, out var config) && 
-                !string.IsNullOrEmpty(config.FallbackModel))
+            catch (HttpRequestException ex)
             {
-                fallbackModel = config.FallbackModel;
-                return true;
+                var statusCode = ex.StatusCode;
+                var error = $"模型 {modelName} 请求失败 (HTTP {(int?)statusCode}): {ex.Message}";
+                _logger.LogError(ex, error);
+                return (false, null, error);
             }
-
-            return false;
+            catch (Exception ex)
+            {
+                var error = $"模型 {modelName} 发生意外错误: {ex.Message}";
+                _logger.LogError(ex, error);
+                return (false, null, error);
+            }
         }
 
         private async Task<HttpResponseMessage> ExecuteStreamRequest(
@@ -422,6 +471,26 @@ namespace GeminiFreeSearch.Services
             }, "StreamGenerateContent");
         }
 
+        private bool TryGetFallbackModel(string? currentModel, out string fallbackModel)
+        {
+            fallbackModel = string.Empty;
+            
+            if (string.IsNullOrEmpty(currentModel))
+            {
+                return false;
+            }
+
+            // 检查当前模型是否有直接的 fallback
+            if (_models.TryGetValue(currentModel, out var config) && 
+                !string.IsNullOrEmpty(config.FallbackModel))
+            {
+                fallbackModel = config.FallbackModel;
+                return true;
+            }
+
+            return false;
+        }
+
         // 上传文档到 File API
         public async Task<string> UploadDocumentAsync(Stream fileStream, string fileName, string mimeType, string displayName)
         {
@@ -493,6 +562,267 @@ namespace GeminiFreeSearch.Services
                     throw new GeminiException($"Failed to upload document {fileName}", ex);
                 }
             }, $"UploadDocument_{fileName}");
+        }
+
+        // 自定义异步迭代器类，用于处理流式内容
+        private class StreamContentAsyncEnumerator : IAsyncEnumerable<string>, IAsyncEnumerator<string>
+        {
+            private readonly GeminiService _service;
+            private readonly string? _prompt;
+            private readonly string? _modelName;
+            private readonly List<ChatMessage>? _history;
+            private readonly List<ImageData>? _images;
+            private readonly List<DocumentData>? _documents;
+            private readonly Queue<string> _buffer = new Queue<string>();
+            private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(0);
+            private readonly CancellationTokenSource _cts = new CancellationTokenSource();
+            private bool _completed = false;
+            private Exception? _exception = null;
+            private string _current = string.Empty;
+
+            public StreamContentAsyncEnumerator(
+                GeminiService service,
+                string? prompt,
+                string? modelName,
+                List<ChatMessage>? history,
+                List<ImageData>? images,
+                List<DocumentData>? documents)
+            {
+                _service = service;
+                _prompt = prompt;
+                _modelName = modelName;
+                _history = history;
+                _images = images;
+                _documents = documents;
+
+                // 启动处理任务
+                _ = ProcessAsync();
+            }
+
+            private async Task ProcessAsync()
+            {
+                try
+                {
+                    await ProcessStreamContentAsync();
+                }
+                catch (Exception ex)
+                {
+                    _exception = ex;
+                }
+                finally
+                {
+                    _completed = true;
+                    _semaphore.Release(); // 确保等待的MoveNextAsync可以继续
+                }
+            }
+
+            private async Task ProcessStreamContentAsync()
+            {
+                var currentModel = _modelName;
+                var triedModels = new HashSet<string>();
+                var errorMessages = new List<string>();
+
+                while (true)
+                {
+                    // 1. Resolve model name
+                    string finalModel;
+                    try
+                    {
+                        finalModel = _service.ResolveModelName(currentModel);
+                    }
+                    catch (Exception ex)
+                    {
+                        _service._logger.LogError(ex, "Error resolving model name for {ModelName}", currentModel);
+                        AddChunk($"[Error] 无法解析模型名称 {currentModel}: {ex.Message}");
+                        return;
+                    }
+
+                    if (triedModels.Contains(finalModel))
+                    {
+                        AddChunk($"[Error] 所有可用模型均已尝试失败。错误信息：\n{string.Join("\n", errorMessages)}");
+                        return;
+                    }
+
+                    triedModels.Add(finalModel);
+                    
+                    if (triedModels.Count > 1)
+                    {
+                        AddChunk($"[System] 正在使用备用模型 {finalModel} 重试请求...\n");
+                    }
+
+                    // 2. Try all API keys with current model
+                    var triedKeys = new HashSet<string>();
+                    bool modelSucceeded = false;
+                    
+                    while (triedKeys.Count < _service._apiKeys.Length && !modelSucceeded)
+                    {
+                        var currentKey = _service.GetCurrentApiKey();
+                        triedKeys.Add(currentKey);
+                        
+                        try
+                        {
+                            var result = await _service.TryExecuteStreamRequest(
+                                finalModel, _prompt, _history, _images, _documents);
+
+                            if (result.success && result.response != null)
+                            {
+                                try
+                                {
+                                    await ProcessResponseStream(result.response);
+                                    return; // Success, we're done
+                                }
+                                catch (Exception ex)
+                                {
+                                    _service._logger.LogError(ex, "Error processing stream response from model {Model}", finalModel);
+                                    errorMessages.Add($"处理 {finalModel} 响应时出错: {ex.Message}");
+                                    // Continue to next key or model
+                                }
+                            }
+                            else
+                            {
+                                errorMessages.Add(result.error);
+                            }
+                        }
+                        catch (GeminiException ex)
+                        {
+                            _service._logger.LogError(ex, "GeminiException with model {Model}", finalModel);
+                            errorMessages.Add($"模型 {finalModel} 错误: {ex.Message}");
+                        }
+                        catch (Exception ex)
+                        {
+                            _service._logger.LogError(ex, "Unexpected error with model {Model}", finalModel);
+                            errorMessages.Add($"模型 {finalModel} 意外错误: {ex.Message}");
+                        }
+                        
+                        // Try next key if available
+                        if (triedKeys.Count < _service._apiKeys.Length)
+                        {
+                            _service.GetNextApiKey();
+                            AddChunk($"[System] 正在使用下一个API密钥重试请求...\n");
+                        }
+                    }
+
+                    // 3. If all keys failed with current model, try fallback model
+                    try
+                    {
+                        if (!_service.TryGetFallbackModel(currentModel, out var fallbackModel) || 
+                            string.IsNullOrEmpty(fallbackModel))
+                        {
+                            AddChunk($"[Error] {string.Join("\n", errorMessages)}\n没有可用的备用模型。");
+                            return;
+                        }
+                        
+                        currentModel = fallbackModel;
+                    }
+                    catch (Exception ex)
+                    {
+                        _service._logger.LogError(ex, "Error getting fallback model for {Model}", currentModel);
+                        AddChunk($"[Error] {string.Join("\n", errorMessages)}\n获取备用模型时出错: {ex.Message}");
+                        return;
+                    }
+                }
+            }
+
+            private async Task ProcessResponseStream(HttpResponseMessage response)
+            {
+                using var responseStream = await response.Content.ReadAsStreamAsync();
+                using var reader = new StreamReader(responseStream);
+
+                while (!reader.EndOfStream)
+                {
+                    var line = await reader.ReadLineAsync();
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    if (!line.StartsWith("data:")) continue;
+
+                    var jsonLine = line["data:".Length..].Trim();
+                    if (string.IsNullOrEmpty(jsonLine)) continue;
+
+                    using var doc = JsonDocument.Parse(jsonLine);
+                    if (!doc.RootElement.TryGetProperty("candidates", out var candidates) ||
+                        candidates.ValueKind != JsonValueKind.Array ||
+                        candidates.GetArrayLength() == 0) continue;
+
+                    var firstCandidate = candidates[0];
+                    if (!firstCandidate.TryGetProperty("content", out var contentObj) ||
+                        !contentObj.TryGetProperty("parts", out var parts) ||
+                        parts.ValueKind != JsonValueKind.Array) continue;
+
+                    foreach (var part in parts.EnumerateArray())
+                    {
+                        if (part.TryGetProperty("text", out var textElement))
+                        {
+                            var textChunk = textElement.GetString();
+                            if (!string.IsNullOrEmpty(textChunk))
+                            {
+                                AddChunk(textChunk);
+                            }
+                        }
+                    }
+                }
+            }
+
+            private void AddChunk(string chunk)
+            {
+                lock (_buffer)
+                {
+                    _buffer.Enqueue(chunk);
+                }
+                _semaphore.Release();
+            }
+
+            public async ValueTask<bool> MoveNextAsync()
+            {
+                while (true)
+                {
+                    // 检查缓冲区中是否有数据
+                    lock (_buffer)
+                    {
+                        if (_buffer.Count > 0)
+                        {
+                            _current = _buffer.Dequeue();
+                            return true;
+                        }
+
+                        if (_completed)
+                        {
+                            if (_exception != null)
+                            {
+                                throw _exception;
+                            }
+                            return false;
+                        }
+                    }
+
+                    // 等待新数据或完成信号
+                    await _semaphore.WaitAsync();
+                }
+            }
+
+            public string Current => _current;
+
+            public ValueTask DisposeAsync()
+            {
+                _cts.Cancel();
+                _semaphore.Dispose();
+                _cts.Dispose();
+                return ValueTask.CompletedTask;
+            }
+
+            public IAsyncEnumerator<string> GetAsyncEnumerator(CancellationToken cancellationToken = default)
+            {
+                return this;
+            }
+        }
+
+        public IAsyncEnumerable<string> StreamGenerateContentAsync(
+            string? prompt,
+            string? modelName,
+            List<ChatMessage>? history = null,
+            List<ImageData>? images = null,
+            List<DocumentData>? documents = null)
+        {
+            return new StreamContentAsyncEnumerator(
+                this, prompt, modelName, history, images, documents);
         }
 
         private class ModelConfig

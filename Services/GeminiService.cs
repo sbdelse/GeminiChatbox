@@ -165,6 +165,64 @@ namespace GeminiFreeSearch.Services
             return false;
         }
 
+        private async IAsyncEnumerable<string> ProcessStreamResponse(HttpResponseMessage response)
+        {
+            ArgumentNullException.ThrowIfNull(response);
+
+            using var responseStream = await response.Content.ReadAsStreamAsync();
+            using var reader = new StreamReader(responseStream);
+            string? line = null;
+
+            while (!reader.EndOfStream)
+            {
+                string? textChunk = null;
+                
+                try
+                {
+                    line = await reader.ReadLineAsync();
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    if (!line.StartsWith("data:")) continue;
+
+                    var jsonLine = line["data:".Length..].Trim();
+                    if (string.IsNullOrEmpty(jsonLine) || jsonLine == "[DONE]") continue;
+
+                    using var doc = JsonDocument.Parse(jsonLine);
+                    if (!doc.RootElement.TryGetProperty("candidates", out var candidates) ||
+                        candidates.ValueKind != JsonValueKind.Array ||
+                        candidates.GetArrayLength() == 0) continue;
+
+                    var firstCandidate = candidates[0];
+                    if (!firstCandidate.TryGetProperty("content", out var contentObj) ||
+                        !contentObj.TryGetProperty("parts", out var parts) ||
+                        parts.ValueKind != JsonValueKind.Array) continue;
+
+                    foreach (var part in parts.EnumerateArray())
+                    {
+                        if (part.TryGetProperty("text", out var textElement))
+                        {
+                            textChunk = textElement.GetString();
+                            if (!string.IsNullOrEmpty(textChunk))
+                            {
+                                // 不在try块中yield，而是在外部
+                                break;
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error processing stream response line: {Line}", line);
+                    throw; // Rethrow to be handled by the caller
+                }
+                
+                // 在try/catch外部yield
+                if (!string.IsNullOrEmpty(textChunk))
+                {
+                    yield return textChunk;
+                }
+            }
+        }
+
         public async IAsyncEnumerable<string> StreamGenerateContentAsync(
             string? prompt,
             string? modelName,
@@ -175,7 +233,6 @@ namespace GeminiFreeSearch.Services
             var currentModel = modelName;
             var triedModels = new HashSet<string>();
             var errorMessages = new List<string>();
-            var responseChunks = new List<string>();
 
             while (true)
             {
@@ -210,31 +267,30 @@ namespace GeminiFreeSearch.Services
 
                     if (success && response != null)
                     {
-                        // Process successful response
-                        responseChunks.Clear();
-                        bool processingSucceeded = true;
-                        string processingError = string.Empty;
+                        // 处理流式响应
+                        var streamProcessed = false;
+                        var chunks = new List<string>();
+                        Exception? processingException = null;
                         
                         try
                         {
-                            // Process the stream without using yield in try/catch
                             await foreach (var chunk in ProcessStreamResponse(response))
                             {
-                                responseChunks.Add(chunk);
+                                chunks.Add(chunk);
                             }
+                            streamProcessed = true;
                         }
                         catch (Exception ex)
                         {
-                            processingSucceeded = false;
+                            processingException = ex;
                             _logger.LogError(ex, "Error processing stream response from model {Model}", finalModel);
-                            processingError = $"处理响应时出错: {ex.Message}";
-                            error = processingError;
+                            error = $"处理响应时出错: {ex.Message}";
                         }
                         
-                        if (processingSucceeded)
+                        // 在try/catch外部yield
+                        if (streamProcessed)
                         {
-                            // Now yield the chunks outside the try/catch
-                            foreach (var chunk in responseChunks)
+                            foreach (var chunk in chunks)
                             {
                                 yield return chunk;
                             }
@@ -406,62 +462,6 @@ namespace GeminiFreeSearch.Services
                 resp.EnsureSuccessStatusCode();
                 return resp;
             }, "StreamGenerateContent");
-        }
-
-        private async IAsyncEnumerable<string> ProcessStreamResponse(HttpResponseMessage response)
-        {
-            ArgumentNullException.ThrowIfNull(response);
-
-            using var responseStream = await response.Content.ReadAsStreamAsync();
-            using var reader = new StreamReader(responseStream);
-            string? line = null;
-            var chunks = new List<string>();
-
-            try
-            {
-                while (!reader.EndOfStream)
-                {
-                    line = await reader.ReadLineAsync();
-                    if (string.IsNullOrWhiteSpace(line)) continue;
-                    if (!line.StartsWith("data:")) continue;
-
-                    var jsonLine = line["data:".Length..].Trim();
-                    if (string.IsNullOrEmpty(jsonLine) || jsonLine == "[DONE]") continue;
-
-                    using var doc = JsonDocument.Parse(jsonLine);
-                    if (!doc.RootElement.TryGetProperty("candidates", out var candidates) ||
-                        candidates.ValueKind != JsonValueKind.Array ||
-                        candidates.GetArrayLength() == 0) continue;
-
-                    var firstCandidate = candidates[0];
-                    if (!firstCandidate.TryGetProperty("content", out var contentObj) ||
-                        !contentObj.TryGetProperty("parts", out var parts) ||
-                        parts.ValueKind != JsonValueKind.Array) continue;
-
-                    foreach (var part in parts.EnumerateArray())
-                    {
-                        if (part.TryGetProperty("text", out var textElement))
-                        {
-                            var textChunk = textElement.GetString();
-                            if (!string.IsNullOrEmpty(textChunk))
-                            {
-                                chunks.Add(textChunk);
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error processing stream response line: {Line}", line);
-                throw; // Rethrow to be handled by the caller
-            }
-            
-            // Yield chunks outside the try/catch
-            foreach (var chunk in chunks)
-            {
-                yield return chunk;
-            }
         }
 
         private bool TryGetFallbackModel(string? currentModel, out string fallbackModel)

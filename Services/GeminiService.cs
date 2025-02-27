@@ -198,13 +198,14 @@ namespace GeminiFreeSearch.Services
                 
                 while (!allKeysTried)
                 {
-                    var (success, response, error) = await TryExecuteStreamRequest(
+                    var result = await TryExecuteStreamRequest(
                         finalModel, prompt, history, images, documents);
-
-                    if (success && response != null)
+                    
+                    if (result.success && result.response != null)
                     {
                         // Process successful response
-                        await foreach (var chunk in ProcessStreamResponse(response))
+                        var chunks = await ProcessStreamResponseToList(result.response);
+                        foreach (var chunk in chunks)
                         {
                             yield return chunk;
                         }
@@ -217,7 +218,7 @@ namespace GeminiFreeSearch.Services
                     if (triedKeys.Count >= _apiKeys.Length)
                     {
                         allKeysTried = true;
-                        errorMessages.Add(error);
+                        errorMessages.Add(result.error);
                     }
                     else
                     {
@@ -253,7 +254,20 @@ namespace GeminiFreeSearch.Services
             catch (HttpRequestException ex)
             {
                 var statusCode = ex.StatusCode;
+                var errorContent = string.Empty;
+                
+                // Try to extract more detailed error information if available
+                if (ex.Data.Contains("ResponseContent"))
+                {
+                    errorContent = ex.Data["ResponseContent"] as string ?? string.Empty;
+                }
+                
                 var error = $"模型 {modelName} 请求失败 (HTTP {(int?)statusCode}): {ex.Message}";
+                if (!string.IsNullOrEmpty(errorContent))
+                {
+                    error += $"\n详细错误: {errorContent}";
+                }
+                
                 _logger.LogError(ex, error);
                 return (false, null, error);
             }
@@ -265,9 +279,10 @@ namespace GeminiFreeSearch.Services
             }
         }
 
-        private async IAsyncEnumerable<string> ProcessStreamResponse(HttpResponseMessage response)
+        private async Task<List<string>> ProcessStreamResponseToList(HttpResponseMessage response)
         {
             ArgumentNullException.ThrowIfNull(response);
+            var result = new List<string>();
 
             using var responseStream = await response.Content.ReadAsStreamAsync();
             using var reader = new StreamReader(responseStream);
@@ -281,28 +296,38 @@ namespace GeminiFreeSearch.Services
                 var jsonLine = line["data:".Length..].Trim();
                 if (string.IsNullOrEmpty(jsonLine)) continue;
 
-                using var doc = JsonDocument.Parse(jsonLine);
-                if (!doc.RootElement.TryGetProperty("candidates", out var candidates) ||
-                    candidates.ValueKind != JsonValueKind.Array ||
-                    candidates.GetArrayLength() == 0) continue;
-
-                var firstCandidate = candidates[0];
-                if (!firstCandidate.TryGetProperty("content", out var contentObj) ||
-                    !contentObj.TryGetProperty("parts", out var parts) ||
-                    parts.ValueKind != JsonValueKind.Array) continue;
-
-                foreach (var part in parts.EnumerateArray())
+                try
                 {
-                    if (part.TryGetProperty("text", out var textElement))
+                    using var doc = JsonDocument.Parse(jsonLine);
+                    if (!doc.RootElement.TryGetProperty("candidates", out var candidates) ||
+                        candidates.ValueKind != JsonValueKind.Array ||
+                        candidates.GetArrayLength() == 0) continue;
+
+                    var firstCandidate = candidates[0];
+                    if (!firstCandidate.TryGetProperty("content", out var contentObj) ||
+                        !contentObj.TryGetProperty("parts", out var parts) ||
+                        parts.ValueKind != JsonValueKind.Array) continue;
+
+                    foreach (var part in parts.EnumerateArray())
                     {
-                        var textChunk = textElement.GetString();
-                        if (!string.IsNullOrEmpty(textChunk))
+                        if (part.TryGetProperty("text", out var textElement))
                         {
-                            yield return textChunk;
+                            var textChunk = textElement.GetString();
+                            if (!string.IsNullOrEmpty(textChunk))
+                            {
+                                result.Add(textChunk);
+                            }
                         }
                     }
                 }
+                catch (JsonException ex)
+                {
+                    _logger.LogError(ex, "Error parsing JSON response: {JsonLine}", jsonLine);
+                    result.Add($"[Error] JSON解析错误: {ex.Message}");
+                }
             }
+
+            return result;
         }
 
         private bool TryGetFallbackModel(string? currentModel, out string fallbackModel)
@@ -417,7 +442,32 @@ namespace GeminiFreeSearch.Services
                 var resp = await _httpClient.SendAsync(
                     newRequestMessage, 
                     HttpCompletionOption.ResponseHeadersRead);
-                resp.EnsureSuccessStatusCode();
+                
+                try
+                {
+                    resp.EnsureSuccessStatusCode();
+                }
+                catch (HttpRequestException ex)
+                {
+                    // Capture response content for better error reporting
+                    if (resp.Content != null)
+                    {
+                        try
+                        {
+                            var errorContent = await resp.Content.ReadAsStringAsync();
+                            ex.Data["ResponseContent"] = errorContent;
+                            
+                            _logger.LogError("API Error Response: {ErrorContent}", errorContent);
+                        }
+                        catch (Exception readEx)
+                        {
+                            _logger.LogError(readEx, "Failed to read error response content");
+                        }
+                    }
+                    
+                    throw;
+                }
+                
                 return resp;
             }, "StreamGenerateContent");
         }

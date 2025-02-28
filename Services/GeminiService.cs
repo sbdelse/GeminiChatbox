@@ -121,6 +121,29 @@ namespace GeminiFreeSearch.Services
                     
                     await Task.Delay(delay);
                 }
+                catch (Exception ex) when (IsTimeoutError(ex))
+                {
+                    // For timeout errors, switch to the next API key
+                    var currentKey = GetCurrentApiKey();
+                    if (!triedKeys.Contains(currentKey))
+                    {
+                        triedKeys.Add(currentKey);
+                    }
+
+                    if (triedKeys.Count >= _apiKeys.Length)
+                    {
+                        _logger.LogError(ex, "All API keys failed with timeout error for {Operation}", operationName);
+                        throw new GeminiException($"All API keys failed with timeout error. The request may be too large or the server is overloaded.");
+                    }
+
+                    _logger.LogWarning(ex, "Timeout error for key {KeyIndex}, switching to next key", _currentKeyIndex);
+                    while (triedKeys.Contains(GetCurrentApiKey()))
+                    {
+                        GetNextApiKey();
+                    }
+
+                    continue;
+                }
                 catch (HttpRequestException ex) when (IsModelError(ex))
                 {
                     // 对于模型错误（如400 Bad Request），切换到下一个API密钥
@@ -193,6 +216,28 @@ namespace GeminiFreeSearch.Services
             return false;
         }
 
+        public bool IsTimeoutError(Exception ex)
+        {
+            // Check for TaskCanceledException due to timeout
+            if (ex is TaskCanceledException || 
+                ex is OperationCanceledException || 
+                (ex is HttpRequestException && ex.InnerException is TaskCanceledException) ||
+                (ex is HttpRequestException && ex.InnerException is TimeoutException) ||
+                ex is TimeoutException)
+            {
+                return true;
+            }
+            
+            // Check for "The request was canceled due to the configured HttpClient.Timeout" message
+            if (ex.Message.Contains("HttpClient.Timeout") || 
+                (ex.InnerException?.Message?.Contains("HttpClient.Timeout") == true))
+            {
+                return true;
+            }
+            
+            return false;
+        }
+
         public async Task StreamGenerateContentAsync(
             string? prompt,
             string? modelName,
@@ -253,6 +298,12 @@ namespace GeminiFreeSearch.Services
                                 await ProcessStreamResponseWithCallback(response, onChunkReceived);
                                 return; // Success, we're done
                             }
+                            catch (Exception ex) when (IsTimeoutError(ex))
+                            {
+                                _logger.LogError(ex, "Timeout error processing stream response from model {Model}", finalModel);
+                                errorMessages.Add($"处理 {finalModel} 响应时超时: {ex.Message}");
+                                // Continue to next key or model
+                            }
                             catch (Exception ex)
                             {
                                 _logger.LogError(ex, "Error processing stream response from model {Model}", finalModel);
@@ -269,6 +320,11 @@ namespace GeminiFreeSearch.Services
                     {
                         _logger.LogError(ex, "GeminiException with model {Model}", finalModel);
                         errorMessages.Add($"模型 {finalModel} 错误: {ex.Message}");
+                    }
+                    catch (Exception ex) when (IsTimeoutError(ex))
+                    {
+                        _logger.LogError(ex, "Timeout error with model {Model}", finalModel);
+                        errorMessages.Add($"模型 {finalModel} 请求超时: {ex.Message}");
                     }
                     catch (Exception ex)
                     {
@@ -363,6 +419,12 @@ namespace GeminiFreeSearch.Services
             {
                 var statusCode = ex.StatusCode;
                 var error = $"模型 {modelName} 请求失败 (HTTP {(int?)statusCode}): {ex.Message}";
+                _logger.LogError(ex, error);
+                return (false, null, error);
+            }
+            catch (Exception ex) when (IsTimeoutError(ex))
+            {
+                var error = $"模型 {modelName} 请求超时: {ex.Message}";
                 _logger.LogError(ex, error);
                 return (false, null, error);
             }
@@ -671,6 +733,12 @@ namespace GeminiFreeSearch.Services
                                     await ProcessResponseStream(result.response);
                                     return; // Success, we're done
                                 }
+                                catch (Exception ex) when (_service.IsTimeoutError(ex))
+                                {
+                                    _service._logger.LogError(ex, "Timeout error processing stream response from model {Model}", finalModel);
+                                    errorMessages.Add($"处理 {finalModel} 响应时超时: {ex.Message}");
+                                    // Continue to next key or model
+                                }
                                 catch (Exception ex)
                                 {
                                     _service._logger.LogError(ex, "Error processing stream response from model {Model}", finalModel);
@@ -687,6 +755,11 @@ namespace GeminiFreeSearch.Services
                         {
                             _service._logger.LogError(ex, "GeminiException with model {Model}", finalModel);
                             errorMessages.Add($"模型 {finalModel} 错误: {ex.Message}");
+                        }
+                        catch (Exception ex) when (_service.IsTimeoutError(ex))
+                        {
+                            _service._logger.LogError(ex, "Timeout error with model {Model}", finalModel);
+                            errorMessages.Add($"模型 {finalModel} 请求超时: {ex.Message}");
                         }
                         catch (Exception ex)
                         {
@@ -725,39 +798,52 @@ namespace GeminiFreeSearch.Services
 
             private async Task ProcessResponseStream(HttpResponseMessage response)
             {
-                using var responseStream = await response.Content.ReadAsStreamAsync();
-                using var reader = new StreamReader(responseStream);
-
-                while (!reader.EndOfStream)
+                try
                 {
-                    var line = await reader.ReadLineAsync();
-                    if (string.IsNullOrWhiteSpace(line)) continue;
-                    if (!line.StartsWith("data:")) continue;
+                    using var responseStream = await response.Content.ReadAsStreamAsync();
+                    using var reader = new StreamReader(responseStream);
 
-                    var jsonLine = line["data:".Length..].Trim();
-                    if (string.IsNullOrEmpty(jsonLine)) continue;
-
-                    using var doc = JsonDocument.Parse(jsonLine);
-                    if (!doc.RootElement.TryGetProperty("candidates", out var candidates) ||
-                        candidates.ValueKind != JsonValueKind.Array ||
-                        candidates.GetArrayLength() == 0) continue;
-
-                    var firstCandidate = candidates[0];
-                    if (!firstCandidate.TryGetProperty("content", out var contentObj) ||
-                        !contentObj.TryGetProperty("parts", out var parts) ||
-                        parts.ValueKind != JsonValueKind.Array) continue;
-
-                    foreach (var part in parts.EnumerateArray())
+                    while (!reader.EndOfStream)
                     {
-                        if (part.TryGetProperty("text", out var textElement))
+                        var line = await reader.ReadLineAsync();
+                        if (string.IsNullOrWhiteSpace(line)) continue;
+                        if (!line.StartsWith("data:")) continue;
+
+                        var jsonLine = line["data:".Length..].Trim();
+                        if (string.IsNullOrEmpty(jsonLine)) continue;
+
+                        using var doc = JsonDocument.Parse(jsonLine);
+                        if (!doc.RootElement.TryGetProperty("candidates", out var candidates) ||
+                            candidates.ValueKind != JsonValueKind.Array ||
+                            candidates.GetArrayLength() == 0) continue;
+
+                        var firstCandidate = candidates[0];
+                        if (!firstCandidate.TryGetProperty("content", out var contentObj) ||
+                            !contentObj.TryGetProperty("parts", out var parts) ||
+                            parts.ValueKind != JsonValueKind.Array) continue;
+
+                        foreach (var part in parts.EnumerateArray())
                         {
-                            var textChunk = textElement.GetString();
-                            if (!string.IsNullOrEmpty(textChunk))
+                            if (part.TryGetProperty("text", out var textElement))
                             {
-                                AddChunk(textChunk);
+                                var textChunk = textElement.GetString();
+                                if (!string.IsNullOrEmpty(textChunk))
+                                {
+                                    AddChunk(textChunk);
+                                }
                             }
                         }
                     }
+                }
+                catch (Exception ex) when (_service.IsTimeoutError(ex))
+                {
+                    _service._logger.LogError(ex, "Timeout error while processing response stream");
+                    throw new GeminiException("请求处理超时，可能是因为响应过大或网络不稳定", ex);
+                }
+                catch (Exception ex)
+                {
+                    _service._logger.LogError(ex, "Error processing response stream");
+                    throw;
                 }
             }
 

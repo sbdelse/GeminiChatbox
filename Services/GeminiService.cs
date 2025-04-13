@@ -21,6 +21,14 @@ namespace GeminiFreeSearch.Services
             TimeSpan.FromSeconds(2),
             TimeSpan.FromSeconds(4)
         };
+        
+        // Circuit breaker variables
+        private int _requestCount = 0;
+        private readonly object _circuitBreakerLock = new object();
+        private DateTime _resetTime = DateTime.UtcNow;
+        private const int MaxRequestsPerMinute = 60;
+        private bool _circuitOpen = false;
+        private readonly TimeSpan _circuitResetPeriod = TimeSpan.FromMinutes(1);
 
         public GeminiService(
             HttpClient httpClient, 
@@ -29,6 +37,9 @@ namespace GeminiFreeSearch.Services
         {
             _httpClient = httpClient;
             _logger = logger;
+            
+            // Set reasonable timeout
+            _httpClient.Timeout = TimeSpan.FromSeconds(30);
             
             // 从配置中获取 API keys 数组
             _apiKeys = configuration.GetSection("GeminiApi:ApiKeys").Get<string[]>() 
@@ -425,6 +436,12 @@ namespace GeminiFreeSearch.Services
             List<ImageData>? images,
             List<DocumentData>? documents)
         {
+            // Check if circuit breaker is open
+            if (IsCircuitBreakerOpen())
+            {
+                return (false, null, $"请求频率过高，请稍后再试。Rate limiting active, please wait.");
+            }
+            
             try 
             {
                 var response = await ExecuteStreamRequest(modelName, prompt, history, images, documents);
@@ -451,6 +468,44 @@ namespace GeminiFreeSearch.Services
             }
         }
 
+        private bool IsCircuitBreakerOpen()
+        {
+            lock (_circuitBreakerLock)
+            {
+                // If circuit is open, check if reset period has passed
+                if (_circuitOpen)
+                {
+                    if (DateTime.UtcNow > _resetTime)
+                    {
+                        // Reset circuit breaker
+                        _circuitOpen = false;
+                        _requestCount = 0;
+                        _resetTime = DateTime.UtcNow.Add(_circuitResetPeriod);
+                        return false;
+                    }
+                    return true;
+                }
+                
+                // Check if we need to reset counter
+                if (DateTime.UtcNow > _resetTime)
+                {
+                    _requestCount = 0;
+                    _resetTime = DateTime.UtcNow.Add(_circuitResetPeriod);
+                }
+                
+                // Increment counter and check if we've exceeded limit
+                _requestCount++;
+                if (_requestCount > MaxRequestsPerMinute)
+                {
+                    _circuitOpen = true;
+                    _logger.LogWarning("Circuit breaker opened due to excessive requests: {Count} in period", _requestCount);
+                    return true;
+                }
+                
+                return false;
+            }
+        }
+
         private async Task<HttpResponseMessage> ExecuteStreamRequest(
             string modelName,
             string? prompt,
@@ -458,9 +513,6 @@ namespace GeminiFreeSearch.Services
             List<ImageData>? images,
             List<DocumentData>? documents)
         {
-            var apiKey = GetNextApiKey();
-            var requestUrl = $"{_baseUrl}/models/{modelName}:streamGenerateContent?alt=sse&key={apiKey}";
-
             var contents = new List<object>();
 
             // Add history if present
@@ -532,11 +584,17 @@ namespace GeminiFreeSearch.Services
             var requestBody = new { contents = contents.ToArray() };
             var json = JsonSerializer.Serialize(requestBody);
 
+            // ExecuteWithRetryAsync handles key selection and rotation
             return await ExecuteWithRetryAsync(async () =>
             {
+                // Get the API key selected by ExecuteWithRetryAsync for THIS attempt
+                var currentApiKey = GetCurrentApiKey(); 
+                var attemptRequestUrl = $"{_baseUrl}/models/{modelName}:streamGenerateContent?alt=sse&key={currentApiKey}";
+                _logger.LogDebug("Attempting request with URL: {Url}", attemptRequestUrl); // Added debug log
+
                 // Create the StringContent inside this lambda to prevent disposal issues
                 using var requestContent = new StringContent(json, Encoding.UTF8, "application/json");
-                using var newRequestMessage = new HttpRequestMessage(HttpMethod.Post, requestUrl)
+                using var newRequestMessage = new HttpRequestMessage(HttpMethod.Post, attemptRequestUrl) // Use the attempt-specific URL
                 {
                     Content = requestContent
                 };
@@ -544,7 +602,14 @@ namespace GeminiFreeSearch.Services
                 var resp = await _httpClient.SendAsync(
                     newRequestMessage, 
                     HttpCompletionOption.ResponseHeadersRead);
-                resp.EnsureSuccessStatusCode();
+                
+                // Check status code BEFORE EnsureSuccessStatusCode to handle specific cases if needed
+                if (!resp.IsSuccessStatusCode)
+                {
+                    _logger.LogWarning("Request failed with status code {StatusCode} for URL: {Url}", resp.StatusCode, attemptRequestUrl);
+                }
+
+                resp.EnsureSuccessStatusCode(); // Throws HttpRequestException on failure
                 return resp;
             }, "StreamGenerateContent");
         }
@@ -699,10 +764,12 @@ namespace GeminiFreeSearch.Services
                 var currentModel = _modelName;
                 var triedModels = new HashSet<string>();
                 var errorMessages = new List<string>();
+                const int maxModelRetries = 3; // Limit number of model retries (e.g., initial + 2 fallbacks)
+                int retryCount = 0;
 
-                while (true)
+                while (retryCount < maxModelRetries)
                 {
-                    // 1. Resolve model name
+                    retryCount++;
                     string finalModel;
                     try
                     {
@@ -717,99 +784,92 @@ namespace GeminiFreeSearch.Services
 
                     if (triedModels.Contains(finalModel))
                     {
-                        AddChunk($"[Error] 所有可用模型均已尝试失败。错误信息：\n{string.Join("\n", errorMessages)}");
-                        return;
+                         // Avoid retrying the same resolved model (e.g., if fallback points back)
+                         _service._logger.LogWarning("Skipping already tried model: {ModelName}", finalModel);
+                         goto TryFallback; // Skip to next fallback attempt
                     }
 
                     triedModels.Add(finalModel);
                     
-                    if (triedModels.Count > 1)
+                    if (triedModels.Count > 1 || retryCount > 1) // Indicate if it's a retry/fallback
                     {
-                        AddChunk($"[System] 正在使用备用模型 {finalModel} 重试请求...\n");
+                        AddChunk($"[System] 正在使用模型 {finalModel} (尝试次数 {retryCount}) 进行请求...");
                     }
 
-                    // 2. Try all API keys with current model
-                    var triedKeys = new HashSet<string>();
-                    bool modelSucceeded = false;
-                    
-                    while (triedKeys.Count < _service._apiKeys.Length && !modelSucceeded)
+                    HttpResponseMessage? response = null; 
+                    try
                     {
-                        var currentKey = _service.GetCurrentApiKey();
-                        triedKeys.Add(currentKey);
-                        
+                        // Single attempt per model - TryExecuteStreamRequest handles key retries internally
+                        var (success, resp, error) = await _service.TryExecuteStreamRequest(
+                            finalModel, _prompt, _history, _images, _documents);
+
+                        response = resp; // Assign for disposal in finally block
+
+                        if (success && response != null)
+                        {
+                            await ProcessResponseStream(response);
+                            // Successful stream processing
+                            return; // We are done, exit successfully
+                        }
+                        else
+                        {
+                            // Request failed, likely after trying all keys or a non-retryable error.
+                            _service._logger.LogWarning("Request attempt failed for model {Model}. Error: {Error}", finalModel, error);
+                            errorMessages.Add(error); 
+                            // Proceed to TryFallback logic below
+                        }
+                    }
+                    catch (GeminiRateLimitException ex) // All keys hit rate limit
+                    {
+                         _service._logger.LogError(ex, "All keys rate limited for model {Model}", finalModel);
+                         errorMessages.Add($"模型 {finalModel} 所有API密钥均达到速率限制: {ex.Message}");
+                         // Proceed to TryFallback logic below
+                    }
+                    catch (GeminiException ex) // All keys failed for other reasons
+                    {
+                        _service._logger.LogError(ex, "All keys failed for model {Model}", finalModel);
+                        errorMessages.Add($"模型 {finalModel} 所有API密钥均失败: {ex.Message}");
+                        // Proceed to TryFallback logic below
+                    }
+                    catch (Exception ex) // Catch unexpected errors
+                    {
+                        _service._logger.LogError(ex, "Unexpected error during request for model {Model}", finalModel);
+                        errorMessages.Add($"模型 {finalModel} 请求时发生意外错误: {ex.Message}");
+                        // Proceed to TryFallback logic below
+                    }
+                    finally
+                    {
+                        response?.Dispose(); // Ensure response is always disposed
+                    }
+
+                TryFallback:
+                    // Attempt failed for `finalModel`. Try to get a fallback.
+                    if (retryCount < maxModelRetries)
+                    {
                         try
                         {
-                            var result = await _service.TryExecuteStreamRequest(
-                                finalModel, _prompt, _history, _images, _documents);
-
-                            if (result.success && result.response != null)
+                            if (!_service.TryGetFallbackModel(currentModel, out var fallbackModel) || 
+                                string.IsNullOrEmpty(fallbackModel))
                             {
-                                try
-                                {
-                                    await ProcessResponseStream(result.response);
-                                    return; // Success, we're done
-                                }
-                                catch (Exception ex) when (_service.IsTimeoutError(ex))
-                                {
-                                    _service._logger.LogError(ex, "Timeout error processing stream response from model {Model}", finalModel);
-                                    errorMessages.Add($"处理 {finalModel} 响应时超时: {ex.Message}");
-                                    // Continue to next key or model
-                                }
-                                catch (Exception ex)
-                                {
-                                    _service._logger.LogError(ex, "Error processing stream response from model {Model}", finalModel);
-                                    errorMessages.Add($"处理 {finalModel} 响应时出错: {ex.Message}");
-                                    // Continue to next key or model
-                                }
+                                AddChunk($"[Error] 模型 {finalModel} 失败。{string.Join("\n", errorMessages)}\n没有可用的备用模型。" );
+                                return; // No more fallbacks
                             }
-                            else
-                            {
-                                errorMessages.Add(result.error);
-                            }
-                        }
-                        catch (GeminiException ex)
-                        {
-                            _service._logger.LogError(ex, "GeminiException with model {Model}", finalModel);
-                            errorMessages.Add($"模型 {finalModel} 错误: {ex.Message}");
-                        }
-                        catch (Exception ex) when (_service.IsTimeoutError(ex))
-                        {
-                            _service._logger.LogError(ex, "Timeout error with model {Model}", finalModel);
-                            errorMessages.Add($"模型 {finalModel} 请求超时: {ex.Message}");
+                            currentModel = fallbackModel; // Setup for the next loop iteration
                         }
                         catch (Exception ex)
                         {
-                            _service._logger.LogError(ex, "Unexpected error with model {Model}", finalModel);
-                            errorMessages.Add($"模型 {finalModel} 意外错误: {ex.Message}");
-                        }
-                        
-                        // Try next key if available
-                        if (triedKeys.Count < _service._apiKeys.Length)
-                        {
-                            _service.GetNextApiKey();
-                            AddChunk($"[System] 正在使用下一个API密钥重试请求...\n");
+                            _service._logger.LogError(ex, "Error getting fallback model for {Model}", currentModel);
+                            AddChunk($"[Error] 模型 {finalModel} 失败。{string.Join("\n", errorMessages)}\n获取备用模型时出错: {ex.Message}");
+                            return; // Error during fallback lookup
                         }
                     }
-
-                    // 3. If all keys failed with current model, try fallback model
-                    try
+                    else
                     {
-                        if (!_service.TryGetFallbackModel(currentModel, out var fallbackModel) || 
-                            string.IsNullOrEmpty(fallbackModel))
-                        {
-                            AddChunk($"[Error] {string.Join("\n", errorMessages)}\n没有可用的备用模型。");
-                            return;
-                        }
-                        
-                        currentModel = fallbackModel;
+                        // Max retries reached
+                        AddChunk($"[Error] 达到最大模型重试次数 ({maxModelRetries})。所有请求均失败。最终错误信息：\n{string.Join("\n", errorMessages)}");
+                        return; // Exit after max retries
                     }
-                    catch (Exception ex)
-                    {
-                        _service._logger.LogError(ex, "Error getting fallback model for {Model}", currentModel);
-                        AddChunk($"[Error] {string.Join("\n", errorMessages)}\n获取备用模型时出错: {ex.Message}");
-                        return;
-                    }
-                }
+                } // End while loop (retryCount < maxModelRetries)
             }
 
             private async Task ProcessResponseStream(HttpResponseMessage response)

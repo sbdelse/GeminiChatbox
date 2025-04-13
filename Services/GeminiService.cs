@@ -249,9 +249,12 @@ namespace GeminiFreeSearch.Services
             var currentModel = modelName;
             var triedModels = new HashSet<string>();
             var errorMessages = new List<string>();
+            const int maxModelRetries = 3; // Limit number of model retries
+            int retryCount = 0;
 
-            while (true)
+            while (retryCount < maxModelRetries)
             {
+                retryCount++;
                 string finalModel;
                 try
                 {
@@ -280,9 +283,12 @@ namespace GeminiFreeSearch.Services
                 // Try all API keys with current model
                 var triedKeys = new HashSet<string>();
                 bool modelSucceeded = false;
+                int keyRetryCount = 0;
+                int maxKeyRetries = _apiKeys.Length; // Limit to the number of available keys
                 
-                while (triedKeys.Count < _apiKeys.Length && !modelSucceeded)
+                while (keyRetryCount < maxKeyRetries && !modelSucceeded)
                 {
+                    keyRetryCount++;
                     var currentKey = GetCurrentApiKey();
                     triedKeys.Add(currentKey);
                     
@@ -332,30 +338,39 @@ namespace GeminiFreeSearch.Services
                         errorMessages.Add($"模型 {finalModel} 意外错误: {ex.Message}");
                     }
                     
-                    // Try next key if available
-                    if (triedKeys.Count < _apiKeys.Length)
+                    // Try next key if available and we haven't reached the retry limit
+                    if (keyRetryCount < maxKeyRetries)
                     {
                         GetNextApiKey();
                         await onChunkReceived($"[System] 正在使用下一个API密钥重试请求...\n");
                     }
                 }
 
-                // If all keys failed with current model, try fallback model
-                try
+                // If all keys failed with current model, try fallback model if we haven't reached max retries
+                if (retryCount < maxModelRetries)
                 {
-                    if (!TryGetFallbackModel(currentModel, out var fallbackModel) || 
-                        string.IsNullOrEmpty(fallbackModel))
+                    try
                     {
-                        await onChunkReceived($"[Error] {string.Join("\n", errorMessages)}\n没有可用的备用模型。");
+                        if (!TryGetFallbackModel(currentModel, out var fallbackModel) || 
+                            string.IsNullOrEmpty(fallbackModel))
+                        {
+                            await onChunkReceived($"[Error] {string.Join("\n", errorMessages)}\n没有可用的备用模型。");
+                            return;
+                        }
+                        
+                        currentModel = fallbackModel;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error getting fallback model for {Model}", currentModel);
+                        await onChunkReceived($"[Error] {string.Join("\n", errorMessages)}\n获取备用模型时出错: {ex.Message}");
                         return;
                     }
-                    
-                    currentModel = fallbackModel;
                 }
-                catch (Exception ex)
+                else
                 {
-                    _logger.LogError(ex, "Error getting fallback model for {Model}", currentModel);
-                    await onChunkReceived($"[Error] {string.Join("\n", errorMessages)}\n获取备用模型时出错: {ex.Message}");
+                    // We've reached the maximum number of model retries
+                    await onChunkReceived($"[Error] 达到最大重试次数。所有请求均失败，错误信息：\n{string.Join("\n", errorMessages)}");
                     return;
                 }
             }
@@ -516,10 +531,11 @@ namespace GeminiFreeSearch.Services
 
             var requestBody = new { contents = contents.ToArray() };
             var json = JsonSerializer.Serialize(requestBody);
-            var requestContent = new StringContent(json, Encoding.UTF8, "application/json");
 
             return await ExecuteWithRetryAsync(async () =>
             {
+                // Create the StringContent inside this lambda to prevent disposal issues
+                using var requestContent = new StringContent(json, Encoding.UTF8, "application/json");
                 using var newRequestMessage = new HttpRequestMessage(HttpMethod.Post, requestUrl)
                 {
                     Content = requestContent

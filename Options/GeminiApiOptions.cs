@@ -5,6 +5,8 @@ public class GeminiApiOptions
     [Required]
     public string[] ApiKeys { get; set; } = Array.Empty<string>();
     
+    public string[] PremiumApiKeys { get; set; } = Array.Empty<string>();
+    
     [Required]
     [Url]
     public string BaseUrl { get; set; } = string.Empty;

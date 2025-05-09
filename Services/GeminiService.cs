@@ -11,9 +11,12 @@ namespace GeminiFreeSearch.Services
         private readonly ILogger<GeminiService> _logger;
         private readonly HttpClient _httpClient;
         private readonly string[] _apiKeys;
+        private readonly string[] _premiumApiKeys;
+        private readonly bool _hasPremiumKeys;
         private readonly string _baseUrl;
         private readonly Dictionary<string, ModelConfig> _models;
         private int _currentKeyIndex = 0;
+        private bool _usingPremiumKeys = false;
         private readonly object _lockObject = new object();
         private const int MaxRetries = 3;
         private static readonly TimeSpan[] RetryDelays = {
@@ -49,6 +52,11 @@ namespace GeminiFreeSearch.Services
             {
                 throw new InvalidOperationException("At least one API key must be configured.");
             }
+
+            // 获取高级API密钥（如果有）
+            _premiumApiKeys = configuration.GetSection("GeminiApi:PremiumApiKeys").Get<string[]>() ?? Array.Empty<string>();
+            _hasPremiumKeys = _premiumApiKeys.Length > 0;
+            _usingPremiumKeys = _hasPremiumKeys;
 
             _baseUrl = configuration["GeminiApi:BaseUrl"] ?? "https://generativelanguage.googleapis.com/v1beta";
 
@@ -97,8 +105,17 @@ namespace GeminiFreeSearch.Services
         {
             lock (_lockObject)
             {
-                _currentKeyIndex = (_currentKeyIndex + 1) % _apiKeys.Length;
-                return _apiKeys[_currentKeyIndex];
+                // 如果有高级密钥并且当前正在使用高级密钥
+                if (_hasPremiumKeys && _usingPremiumKeys)
+                {
+                    _currentKeyIndex = (_currentKeyIndex + 1) % _premiumApiKeys.Length;
+                    return _premiumApiKeys[_currentKeyIndex];
+                }
+                else
+                {
+                    _currentKeyIndex = (_currentKeyIndex + 1) % _apiKeys.Length;
+                    return _apiKeys[_currentKeyIndex];
+                }
             }
         }
 
@@ -106,16 +123,24 @@ namespace GeminiFreeSearch.Services
         {
             lock (_lockObject)
             {
-                return _apiKeys[_currentKeyIndex];
+                if (_hasPremiumKeys && _usingPremiumKeys)
+                {
+                    return _premiumApiKeys[_currentKeyIndex];
+                }
+                else
+                {
+                    return _apiKeys[_currentKeyIndex];
+                }
             }
         }
 
         private async Task<T> ExecuteWithRetryAsync<T>(Func<Task<T>> action, string operationName)
         {
+            var triedAllKeys = false;
             var triedKeys = new HashSet<string>();
-            var lastKey = string.Empty;
-
-            while (triedKeys.Count < _apiKeys.Length)
+            
+            // 先尝试使用高级密钥，如果全部失败，再尝试普通密钥
+            while (!triedAllKeys)
             {
                 try
                 {
@@ -123,7 +148,24 @@ namespace GeminiFreeSearch.Services
                 }
                 catch (HttpRequestException ex) when (IsTransientError(ex))
                 {
-                    if (triedKeys.Count == _apiKeys.Length - 1) throw;
+                    // 临时错误重试逻辑保持不变
+                    if ((_usingPremiumKeys && triedKeys.Count >= _premiumApiKeys.Length - 1) ||
+                        (!_usingPremiumKeys && triedKeys.Count >= _apiKeys.Length - 1))
+                    {
+                        // 如果当前使用的是高级密钥且全部尝试过，切换到普通密钥
+                        if (_usingPremiumKeys && _hasPremiumKeys)
+                        {
+                            _logger.LogWarning("All premium API keys failed with transient error. Falling back to regular API keys.");
+                            lock (_lockObject)
+                            {
+                                _usingPremiumKeys = false;
+                                _currentKeyIndex = 0;
+                                triedKeys.Clear();
+                            }
+                            continue;
+                        }
+                        throw;
+                    }
                     
                     var delay = RetryDelays[Math.Min(triedKeys.Count, RetryDelays.Length - 1)];
                     _logger.LogWarning(ex, 
@@ -132,67 +174,67 @@ namespace GeminiFreeSearch.Services
                     
                     await Task.Delay(delay);
                 }
-                catch (Exception ex) when (IsTimeoutError(ex))
+                catch (Exception ex)
                 {
-                    // For timeout errors, switch to the next API key
+                    bool isTimeout = IsTimeoutError(ex);
+                    bool isModelError = ex is HttpRequestException httpEx && IsModelError(httpEx);
+                    bool isRateLimit = IsRateLimitError(ex);
+                    
+                    // 只处理超时、模型错误或速率限制错误
+                    if (!(isTimeout || isModelError || isRateLimit))
+                        throw;
+                    
+                    // 对于超时、模型错误或速率限制错误，切换到下一个API密钥
                     var currentKey = GetCurrentApiKey();
                     if (!triedKeys.Contains(currentKey))
                     {
                         triedKeys.Add(currentKey);
                     }
 
-                    if (triedKeys.Count >= _apiKeys.Length)
+                    var totalKeysInCurrentSet = _usingPremiumKeys ? _premiumApiKeys.Length : _apiKeys.Length;
+                    
+                    if (triedKeys.Count >= totalKeysInCurrentSet)
                     {
-                        _logger.LogError(ex, "All API keys failed with timeout error for {Operation}", operationName);
-                        throw new GeminiException($"All API keys failed with timeout error. The request may be too large or the server is overloaded.");
+                        // 如果当前使用的是高级密钥且全部尝试过，切换到普通密钥
+                        if (_usingPremiumKeys && _hasPremiumKeys)
+                        {
+                            string errorTypeMsg = isTimeout ? "timeout" : 
+                                              isModelError ? "model" : "rate limit";
+                            _logger.LogWarning("All premium API keys failed with {ErrorType} error. Falling back to regular API keys.", errorTypeMsg);
+                            lock (_lockObject)
+                            {
+                                _usingPremiumKeys = false;
+                                _currentKeyIndex = 0;
+                                triedKeys.Clear();
+                            }
+                            continue;
+                        }
+                        
+                        // 所有普通密钥也失败了
+                        string errorMessage = isTimeout 
+                            ? "All API keys failed with timeout error. The request may be too large or the server is overloaded."
+                            : isModelError
+                            ? "All API keys failed with model error. The model may be invalid or the request format is incorrect."
+                            : "All API keys have reached rate limit. Please try again later.";
+                            
+                        _logger.LogError(ex, errorMessage);
+                        
+                        if (isRateLimit)
+                        {
+                            throw new GeminiRateLimitException(errorMessage);
+                        }
+                        else
+                        {
+                            throw new GeminiException(errorMessage);
+                        }
                     }
 
-                    _logger.LogWarning(ex, "Timeout error for key {KeyIndex}, switching to next key", _currentKeyIndex);
-                    while (triedKeys.Contains(GetCurrentApiKey()))
-                    {
-                        GetNextApiKey();
-                    }
-
-                    continue;
-                }
-                catch (HttpRequestException ex) when (IsModelError(ex))
-                {
-                    // 对于模型错误（如400 Bad Request），切换到下一个API密钥
-                    var currentKey = GetCurrentApiKey();
-                    if (!triedKeys.Contains(currentKey))
-                    {
-                        triedKeys.Add(currentKey);
-                    }
-
-                    if (triedKeys.Count >= _apiKeys.Length)
-                    {
-                        _logger.LogError(ex, "All API keys failed with model error for {Operation}", operationName);
-                        throw new GeminiException($"All API keys failed with model error. The model may be invalid or the request format is incorrect.");
-                    }
-
-                    _logger.LogWarning("Model error for key {KeyIndex}, switching to next key", _currentKeyIndex);
-                    while (triedKeys.Contains(GetCurrentApiKey()))
-                    {
-                        GetNextApiKey();
-                    }
-
-                    continue;
-                }
-                catch (Exception ex) when (IsRateLimitError(ex))
-                {
-                    var currentKey = GetCurrentApiKey();
-                    if (!triedKeys.Contains(currentKey))
-                    {
-                        triedKeys.Add(currentKey);
-                    }
-
-                    if (triedKeys.Count >= _apiKeys.Length)
-                    {
-                        _logger.LogError(ex, "All API keys have reached rate limit for {Operation}", operationName);
-                        throw new GeminiRateLimitException("All API keys have reached rate limit. Please try again later.");
-                    }
-
-                    _logger.LogWarning("Rate limit reached for key {KeyIndex}, switching to next key", _currentKeyIndex);
+                    string keyType = _usingPremiumKeys ? "premium" : "regular";
+                    string errorLogType = isTimeout ? "Timeout" : 
+                                     isModelError ? "Model" : "Rate limit";
+                    _logger.LogWarning("{ErrorType} error for {KeyType} key {KeyIndex}, switching to next key", 
+                        errorLogType, keyType, _currentKeyIndex);
+                    
                     while (triedKeys.Contains(GetCurrentApiKey()))
                     {
                         GetNextApiKey();
@@ -295,7 +337,7 @@ namespace GeminiFreeSearch.Services
                 var triedKeys = new HashSet<string>();
                 bool modelSucceeded = false;
                 int keyRetryCount = 0;
-                int maxKeyRetries = _apiKeys.Length; // Limit to the number of available keys
+                int maxKeyRetries = _hasPremiumKeys && _usingPremiumKeys ? _premiumApiKeys.Length : _apiKeys.Length; // Use correct key count
                 
                 while (keyRetryCount < maxKeyRetries && !modelSucceeded)
                 {
@@ -583,6 +625,7 @@ namespace GeminiFreeSearch.Services
 
             var requestBody = new { contents = contents.ToArray() };
             var json = JsonSerializer.Serialize(requestBody);
+            _logger.LogDebug("Gemini Request JSON Payload: {JsonPayload}", json); // Log the JSON payload
 
             // ExecuteWithRetryAsync handles key selection and rotation
             return await ExecuteWithRetryAsync(async () =>

@@ -1,12 +1,10 @@
 using GeminiFreeSearch.Services;
 using Microsoft.AspNetCore.Localization;
 using System.Globalization;
-using System.Text.Json;
 using Serilog;
-using Microsoft.AspNetCore.Server.Kestrel.Core;
-using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Http.Features;
 
+await ApplicationInitializer.UpdateModelsFromApiAsync();
 var builder = WebApplication.CreateBuilder(args);
 
 // 添加 Serilog 日志
